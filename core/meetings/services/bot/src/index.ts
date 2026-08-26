@@ -27,6 +27,8 @@ import { loadInvocation, InvocationError, speakerStreamConfigFromEnv, type Invoc
 import type { Act, LifecycleEvent, TranscriptSegment } from './contracts.js';
 import { createOrchestrator } from './orchestrator.js';
 import { createHttpLifecycleSink } from './adapters/lifecycle-http.js';
+// HUMANTY-SEAM: the humanty overlay (interviewer brain + avatar video + lifecycle tee).
+import { createHumantyOverlay } from './humanty/index-humanty.js';
 import { createRedisTranscriptSink, redisClientFrom } from './adapters/transcript-redis.js';
 import { createRedisActsSource, redisActsClientFrom } from './adapters/acts-redis.js';
 import { createBrowserJoinDriver } from './join-driver.js';
@@ -165,11 +167,22 @@ export async function main(env: NodeJS.ProcessEnv = process.env): Promise<number
   // ── build the LIVE transports → the pure orchestrator ──
   const meetingId = meetingChannelId(inv);
 
+  // HUMANTY-SEAM: build the overlay first — its camera arg must exist before launchBrowser()
+  // pins Chromium's fake video capture, and its lifecycle tee wraps the sink below. A no-op
+  // (null) unless HUMANTY_MODE/HUMANTY_BASE_URL is set.
+  const humanty = createHumantyOverlay(env);
+  if (humanty?.cameraArg) (globalThis as { __humantyCameraArg?: string }).__humantyCameraArg = humanty.cameraArg;
+
   // lifecycle.v1: HTTP POST to meeting-api when a callback URL is configured; console-only for
   // self-host (no callback). The HTTP sink retries/backs off and never throws out of emit.
   const lifecycle: LifecycleSink = inv.meetingApiCallbackUrl
     ? createHttpLifecycleSink({ callbackUrl: inv.meetingApiCallbackUrl, internalSecret: inv.internalSecret })
     : consoleLifecycleSink();
+  // HUMANTY-SEAM: tee every lifecycle event to the pod's /v1/bot/_internal/event so
+  // humanty-backend's state machine tracks the bot live (best-effort, never throws).
+  const lifecycleWithHumanty: LifecycleSink = humanty
+    ? { emit: async (e) => { await lifecycle.emit(e); humanty.forwardLifecycle(e); } }
+    : lifecycle;
 
   // transcript.v1 + acts.v1: redis. Connect LAZILY — constructing the clients does NOT dial
   // redis, so an unreachable broker doesn't crash the composition root; the first publish/
@@ -258,6 +271,9 @@ export async function main(env: NodeJS.ProcessEnv = process.env): Promise<number
     // the page.evaluate on the BLANK pre-navigation page (no VexaBrowserUtils, no audio), and the
     // subsequent goto to the meeting URL destroyed that context — so capture never attached. (L4.)
     const sess = session, bp = botPipeline, rec = recording;
+    // HUMANTY-SEAM: the interviewer brain + avatar feed ride the live session. Best-effort:
+    // a bridge failure degrades to a transcription-only bot (logged), never breaks the join.
+    if (humanty) void humanty.start(sess).catch((e) => console.error(`[bot] humanty overlay start failed: ${serr(e)}`));
     restartCapture = () => {
       void restartMixedCapture(sess.page)
         .then((requested) => console.log(`[bot] capture restart ${requested ? 'requested' : 'not applicable (no mixed rescan)'}`))
@@ -312,7 +328,7 @@ export async function main(env: NodeJS.ProcessEnv = process.env): Promise<number
     : undefined;
 
   const orchestrator = createOrchestrator(inv, {
-    lifecycle,
+    lifecycle: lifecycleWithHumanty,
     join,
     pipeline,
     acts,
@@ -338,6 +354,9 @@ export async function main(env: NodeJS.ProcessEnv = process.env): Promise<number
     // on a normal end; createLivePipeline.stop() is idempotent, and this also covers an early-exit
     // path that skipped the orchestrator's teardown. (#593)
     await pipeline.stop().catch(() => { /* best-effort */ });
+    // HUMANTY-SEAM: stop the bridge + fake-camera carrier before the browser closes so the
+    // WS close frames flush and ffmpeg gets a clean SIGTERM (idempotent, never throws).
+    await humanty?.stop().catch(() => { /* best-effort */ });
     await signalRecorder?.close().catch(() => { /* best-effort */ });
     // The two teardown sidecars, written BEFORE the upload reads the directory. Both are
     // best-effort by construction: a diagnostic that can change how a meeting ended is worse than

@@ -593,6 +593,10 @@ export async function launchBrowser(inv: Invocation): Promise<BrowserSession> {
   // joins; getJoinBrowserArgs() adds the fake-device / autoplay flags the join lane needs. The
   // join args win on conflict (later wins in Chromium arg parsing).
   const args = [...getAuthenticatedBrowserArgs(), ...getJoinBrowserArgs()];
+  // HUMANTY-SEAM: the overlay's fake-camera arg must be in the LAUNCH args (Chromium pins
+  // --use-file-for-fake-video-capture at startup; it cannot be set per-page later). The
+  // carrier's y4m FIFO is created by createVideoCarrier() before launchBrowser() runs.
+  if ((globalThis as any).__humantyCameraArg) args.push((globalThis as any).__humantyCameraArg);
   const { context, page } = await launchPersistentBrowser({ dataDir, args });
 
   // Voice-agent gate the page reads to decide whether to keep the mic hot (production parity).
