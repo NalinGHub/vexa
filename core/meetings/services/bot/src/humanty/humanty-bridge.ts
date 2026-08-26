@@ -21,8 +21,8 @@
  *   server → binary v2/v3 packets:
  *     v2: [1B 0x02][2B au_count][4B vlen][4B alen][1B rid_len][8B pts] + rid + H264 + OggOpus
  *     v3: same plus [8B batch_ts_us][4B frame_dur_us] before rid
- *   we demux: H.264 → onVideo callback (page-side decoder paints it);
- *             Ogg-Opus → prism-media demux/decode → s16le 24k mono → paplay → tts_sink.
+ *   we demux: H.264 → onVideo callback (the fake-camera carrier);
+ *             Ogg-Opus → ffmpeg → s16le 24k mono → paplay → tts_sink.
  */
 import { spawn, type ChildProcess } from 'node:child_process';
 import WebSocket from 'ws';
@@ -31,7 +31,6 @@ import type { HumantyConfig } from './config.js';
 
 const SAMPLE_RATE = 24000;
 const CHANNELS = 1;
-const FRAME_SIZE = 480; // 20 ms @ 24 kHz — matches opus-recorder's encoder frames
 
 function pactl(args: string, log: (m: string) => void): void {
   try {
@@ -54,16 +53,6 @@ export interface HumantyBridgeDeps {
   log: (m: string) => void;
 }
 
-type PrismOggDemuxer = { write(b: Buffer): void; destroy?(): void; on(ev: string, cb: (e: Error) => void): void; pipe(d: unknown): void };
-type PrismOpusDecoder = {
-  on(ev: 'data', cb: (pcm: Buffer) => void): void;
-  on(ev: 'error', cb: (e: Error) => void): void;
-  destroy?(): void;
-};
-
-/** Lazy prism-media handle (optional dep of the humanty overlay). */
-let prismMedia: { opus: { OggDemuxer: new () => PrismOggDemuxer; Decoder: new (o: object) => PrismOpusDecoder } } | null | undefined;
-
 export class HumantyBridge {
   private cfg: HumantyConfig;
   private deps: HumantyBridgeDeps;
@@ -71,8 +60,8 @@ export class HumantyBridge {
   private vid: WebSocket | null = null;
 
   private paplayProc: ChildProcess | null = null;
-  private oggDemuxer: PrismOggDemuxer | null = null;
-  private opusDecoder: PrismOpusDecoder | null = null;
+  /** ffmpeg child demuxing+decoding Ogg-Opus → raw PCM into paplay's stdin. */
+  private ffmpegProc: ChildProcess | null = null;
 
   private currentReqId = '';
   private stopping = false;
@@ -278,30 +267,13 @@ export class HumantyBridge {
 
   // ────────────────── audio decode + paplay ──────────────────
 
-  private ensurePcmSink(): void {
-    if (this.paplayProc) return;
-    pactl('set-sink-mute tts_sink 0', this.deps.log);
-    pactl('set-source-mute virtual_mic 0', this.deps.log);
-    const proc = spawn('paplay', [
-      '--raw', '--format=s16le',
-      `--rate=${SAMPLE_RATE}`, `--channels=${CHANNELS}`,
-      '--device=tts_sink',
-    ], { stdio: ['pipe', 'ignore', 'pipe'] });
-    proc.stderr?.on('data', (d) => this.deps.log(`[humanty] paplay stderr: ${String(d).trim()}`));
-    proc.on('exit', () => { if (this.paplayProc === proc) this.paplayProc = null; });
-    proc.on('error', (e) => this.deps.log(`[humanty] paplay spawn failed: ${e.message}`));
-    this.paplayProc = proc;
-  }
-
   private endActivePaplay(): void {
     const proc = this.paplayProc;
     if (proc) {
-      try { proc.stdin?.end(); } catch { /* ignore */ }
-      try { proc.kill('SIGTERM'); } catch { /* ignore */ }
+      try { proc.stdin?.destroy(); } catch { /* ignore */ }
+      try { proc.kill('SIGKILL'); } catch { /* ignore */ }
       this.paplayProc = null;
     }
-    if (this.opusDecoder) { try { this.opusDecoder.destroy?.(); } catch { /* ignore */ } this.opusDecoder = null; }
-    if (this.oggDemuxer) { try { this.oggDemuxer.destroy?.(); } catch { /* ignore */ } this.oggDemuxer = null; }
     pactl('set-sink-mute tts_sink 1', this.deps.log);
     pactl('set-source-mute virtual_mic 1', this.deps.log);
   }
@@ -319,41 +291,56 @@ export class HumantyBridge {
     this.currentReqId = '';
   }
 
+  /**
+   * Decode + play one Ogg-Opus run. ffmpeg does demux+decode in one child
+   * (`-f ogg -i pipe:0` → s16le 24k mono raw) piped straight into paplay —
+   * no node-side codec deps (gate:isolation-clean). Barge-in kills the pair;
+   * the next audio chunk starts a fresh pipeline.
+   */
   private feedOggOpus(audio: Buffer): void {
-    if (!prismMedia) {
-      try {
-        // eslint-disable-next-line @typescript-eslint/no-require-imports, @typescript-eslint/no-var-requires
-        prismMedia = require('prism-media');
-      } catch (e) {
-        this.deps.log(`[humanty] FATAL: prism-media not installed (${String(e)})`);
-        this.fail('prism-media missing');
-        return;
-      }
-    }
-    if (!this.oggDemuxer || !this.opusDecoder || !this.paplayProc) this.ensureDecoderPipeline();
-    if (!this.oggDemuxer) return;
-    try { this.oggDemuxer.write(audio); }
-    catch (e) { this.deps.log(`[humanty] ogg demuxer write failed: ${String(e)}`); }
+    if (this.stopping || audio.length === 0) return;
+    if (!this.ffmpegProc && !this.paplayProc) this.ensureDecoderPipeline();
+    const dec = this.ffmpegProc, sink = this.paplayProc;
+    if (!dec?.stdin || dec.stdin.destroyed || !sink?.stdin || sink.stdin.destroyed) return;
+    try { dec.stdin.write(audio); } catch { /* decoder mid-restart; drop */ }
   }
 
   private ensureDecoderPipeline(): void {
-    if (this.oggDemuxer && this.opusDecoder && this.paplayProc) return;
-    if (!prismMedia) return;
-    this.ensurePcmSink();
+    if (this.ffmpegProc && this.paplayProc) return;
+    // Unmute before the first playback burst (entrypoint leaves the chain muted).
+    pactl('set-sink-mute tts_sink 0', this.deps.log);
+    pactl('set-source-mute virtual_mic 0', this.deps.log);
+    const log = (m: string): void => this.deps.log(m);
 
-    const ogg = new prismMedia.opus.OggDemuxer();
-    const dec = new prismMedia.opus.Decoder({ rate: SAMPLE_RATE, channels: CHANNELS, frameSize: FRAME_SIZE });
-    ogg.pipe(dec);
-    dec.on('data', (pcm: Buffer) => {
-      const proc = this.paplayProc;
-      if (!proc?.stdin || proc.stdin.destroyed) return;
-      try { proc.stdin.write(pcm); } catch { /* ignore */ }
+    // ffmpeg reads Ogg-Opus from stdin and writes raw PCM to paplay's stdin.
+    const ff = spawn('ffmpeg', [
+      '-hide_banner', '-loglevel', 'error',
+      '-f', 'ogg', '-i', 'pipe:0',
+      '-f', 's16le', '-ar', String(SAMPLE_RATE), '-ac', String(CHANNELS),
+      'pipe:1',
+    ], { stdio: ['pipe', 'pipe', 'ignore'] });
+    const paplay = spawn('paplay', [
+      '--raw', '--format=s16le',
+      `--rate=${SAMPLE_RATE}`, `--channels=${CHANNELS}`,
+      '--device=tts_sink',
+    ], { stdio: ['pipe', 'ignore', 'pipe'] });
+    ff.stdout.pipe(paplay.stdin);
+    ff.on('error', (e) => log(`[humanty] ffmpeg spawn failed: ${e.message}`));
+    paplay.on('error', (e) => log(`[humanty] paplay spawn failed: ${e.message}`));
+    paplay.stderr?.on('data', () => { /* noisy; failures surface as silence + exit */ });
+    ff.on('exit', () => {
+      if (this.ffmpegProc === ff) this.ffmpegProc = null;
+      try { paplay.kill('SIGTERM'); } catch { /* ignore */ }
+      this.paplayProc = null;
     });
-    dec.on('error', (err) => this.deps.log(`[humanty] opus decoder error: ${err.message}`));
-    (ogg as unknown as { on: (ev: string, cb: (e: Error) => void) => void }).on('error', (err) => this.deps.log(`[humanty] ogg demuxer error: ${err.message}`));
-
-    this.oggDemuxer = ogg;
-    this.opusDecoder = dec;
+    paplay.on('exit', () => {
+      if (this.paplayProc === paplay) this.paplayProc = null;
+      if (this.ffmpegProc === ff) {
+        try { ff.kill('SIGTERM'); } catch { /* ignore */ }
+      }
+    });
+    this.ffmpegProc = ff;
+    this.paplayProc = paplay;
   }
 
   // ────────────────── error path ──────────────────
