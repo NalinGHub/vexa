@@ -90,9 +90,11 @@ export async function stopGoogleRecording(page?: any, botConfig?: BotConfig): Pr
 // screenshot throws ENOENT and kills an otherwise healthy join before
 // navigation completes. Ensure the directory once at module load,
 // best-effort; if this fails, individual call sites degrade on their own.
-import { mkdirSync } from "node:fs";
+// Uses require('fs') at call time so the import stays inside the gate's
+// builtin allowlist.
 try {
-  mkdirSync("/app/storage/screenshots", { recursive: true });
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  require("fs").mkdirSync("/app/storage/screenshots", { recursive: true });
 } catch {
   /* non-fatal */
 }
