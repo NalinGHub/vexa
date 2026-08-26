@@ -27,7 +27,11 @@
 import { spawn, type ChildProcess } from 'node:child_process';
 import WebSocket from 'ws';
 import type { Page } from 'playwright';
+import { readFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import type { HumantyConfig } from './config.js';
+import { PAGE_AUDIO_TAP } from './page-audio-tap.js';
 
 const SAMPLE_RATE = 24000;
 const CHANNELS = 1;
@@ -73,13 +77,59 @@ export class HumantyBridge {
     this.deps = deps;
   }
 
-  async start(): Promise<void> {
+    async start(): Promise<void> {
     if (this.started) return;
     this.started = true;
     await this.exposePageHooks();
     await this.connectRealtime();
     await this.connectVideo();
     this.deps.log('[humanty] both WS connections open');
+  }
+
+  /**
+   * Install the page-side meeting-audio tap: combines all <audio>/<video>
+   * element streams into one Web Audio graph and ships 20 ms Ogg-Opus chunks
+   * to __humanty_pushOpus (the interviewer brain's ears). Ported from the
+   * prototype's humanty-page-audio.ts; the opus-recorder bundle is vendored
+   * at assets/humanty-audio/ (served via a synthetic route so the worker
+   * loads). Called by the overlay AFTER admission on the live page.
+   */
+  async startPageAudioCapture(): Promise<void> {
+    const page = this.deps.page;
+    try {
+      // opus-recorder UMD first (defines window.Recorder), then the tap.
+      // Assets resolve relative to THIS module (dist/humanty/ → ../../assets)
+      // so the path works both in-image (/opt/...) and from a repo checkout.
+      const here = dirname(fileURLToPath(import.meta.url));
+      const assets = process.env.HUMANTY_AUDIO_ASSETS
+        ?? join(here, '..', '..', 'assets', 'humanty-audio');
+      await page.route('**/__humanty_audio/*', async (route) => {
+        try {
+          const url = new URL(route.request().url());
+          const filename = url.pathname.split('/').pop() || '';
+          // Whitelist to avoid path traversal.
+          if (!/^[A-Za-z0-9._-]+$/.test(filename)) return void route.abort().catch(() => {});
+          const body = readFileSync(join(assets, filename));
+          await route.fulfill({
+            status: 200,
+            contentType: filename.endsWith('.wasm') ? 'application/wasm' : 'application/javascript',
+            body,
+          });
+        } catch { void route.abort().catch(() => {}); }
+      }).catch(() => { /* already routed */ });
+
+      // opus-recorder UMD first (defines window.Recorder), then the tap.
+      await page.addScriptTag({
+        content: readFileSync(join(assets, 'recorder.min.js'), 'utf8'),
+      }).catch((e) => this.deps.log(`[humanty] recorder inject failed: ${String(e)}`));
+      // The tap script: waits for media elements, builds the combined stream,
+      // records with opus-recorder, pushes base64 Ogg-Opus to Node.
+      await page.addScriptTag({ content: PAGE_AUDIO_TAP }).catch((e) =>
+        this.deps.log(`[humanty] audio tap inject failed: ${String(e)}`));
+      this.deps.log('[humanty] page audio capture requested');
+    } catch (e) {
+      this.deps.log(`[humanty] startPageAudioCapture failed (non-fatal): ${String(e)}`);
+    }
   }
 
   /** Idempotent, never throws — safe to call from any teardown path (#593). */

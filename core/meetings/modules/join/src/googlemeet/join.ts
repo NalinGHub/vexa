@@ -321,7 +321,11 @@ export async function joinGoogleMeeting(
   await page.bringToFront();
 
   // Take screenshot after navigation
-  await page.screenshot({ path: '/app/storage/screenshots/bot-checkpoint-0-after-navigation.png', fullPage: true });
+  // HUMANTY-SEAM: best-effort — on hosts without /app this must not kill the join.
+  try {
+    // HUMANTY-SEAM: diagnostics-only screenshot — never fatal.
+    try { await page.screenshot({ path: '/app/storage/screenshots/bot-checkpoint-0-after-navigation.png', fullPage: true }); } catch { /* best-effort */ }
+  } catch { /* diagnostics only */ }
   log("📸 Screenshot taken: After navigation to meeting URL");
 
   // --- Call joining callback to notify meeting-api that bot is joining ---
@@ -397,7 +401,8 @@ export async function joinGoogleMeeting(
     await page.waitForTimeout(5000);
 
     // Diagnostic screenshot to see what the lobby shows
-    await page.screenshot({ path: '/app/storage/screenshots/bot-checkpoint-auth-lobby.png', fullPage: true });
+    // HUMANTY-SEAM: diagnostics-only screenshot — never fatal.
+    try { await page.screenshot({ path: '/app/storage/screenshots/bot-checkpoint-auth-lobby.png', fullPage: true }); } catch { /* best-effort */ }
     log("📸 Diagnostic screenshot: auth lobby state");
 
     // Mute mic and camera if visible
@@ -435,7 +440,8 @@ export async function joinGoogleMeeting(
     // guard holds on non-English lobbies too. A signed-in account that is
     // merely not pre-admitted shows no name input and proceeds to knock.
     if (await isGoogleSignedOutLobby(page)) {
-      await page.screenshot({ path: '/app/storage/screenshots/bot-checkpoint-auth-signed-out.png', fullPage: true });
+      // HUMANTY-SEAM: diagnostics-only screenshot — never fatal.
+      try { await page.screenshot({ path: '/app/storage/screenshots/bot-checkpoint-auth-signed-out.png', fullPage: true }); } catch { /* best-effort */ }
       log("📸 Screenshot: authenticated mode but browser profile is signed out (guest lobby).");
       throw new AuthSessionError(
         "Browser profile signed out — cannot authenticate with Google. Re-authenticate the profile and retry."
@@ -445,7 +451,9 @@ export async function joinGoogleMeeting(
     await clickHandle(ctaHandle, "authenticated_join");
     log(`Bot clicked the authenticated join CTA (via ${ctaSelector}).`);
 
-    await page.screenshot({ path: '/app/storage/screenshots/bot-checkpoint-0-after-join-now.png', fullPage: true });
+    // HUMANTY-SEAM: diagnostics-only screenshot — never fatal.
+
+    try { await page.screenshot({ path: '/app/storage/screenshots/bot-checkpoint-0-after-join-now.png', fullPage: true }); } catch { /* best-effort */ }
     log("📸 Screenshot taken: After join click (authenticated)");
   } else {
     // Anonymous flow: enter bot name and ask to join
@@ -459,7 +467,9 @@ export async function joinGoogleMeeting(
     );
     log("Name input field found.");
 
-    await page.screenshot({ path: '/app/storage/screenshots/bot-checkpoint-0-name-field-found.png', fullPage: true });
+    // HUMANTY-SEAM: diagnostics-only screenshot — never fatal.
+
+    try { await page.screenshot({ path: '/app/storage/screenshots/bot-checkpoint-0-name-field-found.png', fullPage: true }); } catch { /* best-effort */ }
 
     await fillField(nameHandle!, nameFieldSelector, botName, "name");
 
@@ -487,7 +497,9 @@ export async function joinGoogleMeeting(
     await clickHandle(joinHandle!, "ask_to_join");
     log(`${botName} joined the Google Meet Meeting.`);
 
-    await page.screenshot({ path: '/app/storage/screenshots/bot-checkpoint-0-after-ask-to-join.png', fullPage: true });
+    // HUMANTY-SEAM: diagnostics-only screenshot — never fatal.
+
+    try { await page.screenshot({ path: '/app/storage/screenshots/bot-checkpoint-0-after-ask-to-join.png', fullPage: true }); } catch { /* best-effort */ }
     log("📸 Screenshot taken: After clicking 'Ask to join'");
   }
 }

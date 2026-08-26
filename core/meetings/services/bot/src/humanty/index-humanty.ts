@@ -112,6 +112,8 @@ export function createHumantyOverlay(platform: string, env: NodeJS.ProcessEnv = 
       });
       await bridge.start();
       await unmuteMeetingMic(session.page);
+      // Ears: tap the live meeting page for audio → /v1/realtime (brain).
+      await bridge.startPageAudioCapture();
     },
 
     forwardLifecycle(e: LifecycleEvent): void {

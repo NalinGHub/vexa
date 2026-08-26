@@ -40,7 +40,10 @@ export function createVideoCarrier(log: (m: string) => void): VideoCarrier {
 
   // Seed the pipe target with a valid y4m header + one black frame so Chromium's probe
   // succeeds the moment it opens the file — even before the first real frame arrives.
-  const black = Buffer.alloc(OUT_W * OUT_H * 3);
+  // C420jpeg ⇒ 1.5 bytes/pixel (planar Y+U+V); a raw rgb24 frame would be misread and
+  // crash the fake-camera demuxer at launch.
+  const frameBytes = Math.floor(OUT_W * OUT_H * 1.5);
+  const black = Buffer.alloc(frameBytes);
   writeFileSync(fifo, Buffer.concat([
     Buffer.from(`YUV4MPEG2 W${OUT_W} H${OUT_H} F25:1 Ip A1:1 C420jpeg\n`),
     Buffer.from('FRAME\n'),
@@ -54,12 +57,12 @@ export function createVideoCarrier(log: (m: string) => void): VideoCarrier {
   function ensureDecoder(): void {
     if (decoder || stopped) return;
     decoder = spawn('ffmpeg', [
-      '-hide_banner', '-loglevel', 'error',
+      '-hide_banner', '-loglevel', 'error', '-y',
       '-probesize', '32', '-analyzeduration', '0',
       '-f', 'h264', '-i', 'pipe:0',
-      '-vf', `scale=${OUT_W}:${OUT_H}:force_original_aspect_ratio=decrease,pad=${OUT_W}:${OUT_H}:(ow-iw)/2:(oh-ih)/2:black`,
+      '-vf', `scale=${OUT_W}:${OUT_H},format=yuv420p`,
       '-r', '25',
-      '-f', 'rawvideo', '-pix_fmt', 'rgb24',
+      '-f', 'rawvideo', '-pix_fmt', 'yuv420p',
       fifo,
     ], { stdio: ['pipe', 'ignore', 'pipe'] });
     decoder.stderr?.on('data', (d) => log(`[humanty-cam] ffmpeg: ${String(d).trim().slice(0, 200)}`));
