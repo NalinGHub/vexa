@@ -170,7 +170,7 @@ export async function main(env: NodeJS.ProcessEnv = process.env): Promise<number
   // HUMANTY-SEAM: build the overlay first — its camera arg must exist before launchBrowser()
   // pins Chromium's fake video capture, and its lifecycle tee wraps the sink below. A no-op
   // (null) unless HUMANTY_MODE/HUMANTY_BASE_URL is set.
-  const humanty = createHumantyOverlay(env);
+  const humanty = createHumantyOverlay(inv.platform, env);
   if (humanty?.cameraArg) (globalThis as { __humantyCameraArg?: string }).__humantyCameraArg = humanty.cameraArg;
 
   // lifecycle.v1: HTTP POST to meeting-api when a callback URL is configured; console-only for

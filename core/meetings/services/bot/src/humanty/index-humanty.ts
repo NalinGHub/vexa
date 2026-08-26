@@ -58,14 +58,37 @@ export interface HumantyOverlay {
 }
 
 /** Build the overlay. Returns null when humanty mode is off — the single branch the
- *  stock composition root needs. */
-export function createHumantyOverlay(env: NodeJS.ProcessEnv = process.env): HumantyOverlay | null {
+ *  stock composition root needs. `platform` selects the meeting-UI mic selector. */
+export function createHumantyOverlay(platform: string, env: NodeJS.ProcessEnv = process.env): HumantyOverlay | null {
   const cfg = loadHumantyConfig(env);
   if (!cfg.enabled) return null;
 
   const carrier: VideoCarrier = createVideoCarrier(log);
   let bridge: HumantyBridge | null = null;
   let stopped = false;
+
+  /** Unmute the meeting-UI mic ONCE after admission (upstream joins muted; vexa's
+   *  per-speak unmute is act-driven which humanty bypasses). Between avatar turns the
+   *  PulseAudio chain is level-muted, so the open mic only ever carries our bursts. */
+  async function unmuteMeetingMic(page: import('playwright').Page): Promise<void> {
+    try {
+      await page.evaluate(({ platform }) => {
+        const doc = (globalThis as unknown as { document?: { querySelector(sel: string): Element | null; querySelectorAll(sel: string): ArrayLike<Element & { click?(): void; getAttribute(name: string): string | null }> } }).document;
+        const click = (sel: string): void => { doc?.querySelector(sel)?.click(); };
+        if (platform === 'teams') click('#microphone-button');
+        else if (platform === 'zoom') click('.join-audio-container__btn');
+        else {
+          // Google Meet / Jitsi: aria-label match ("microphone" / "Toggle mute audio").
+          const btns = Array.from(doc?.querySelectorAll('[role="button"],button') ?? []);
+          const btn = btns.find((b) => /microphone|mute audio/i.test(b.getAttribute('aria-label') ?? ''));
+          btn?.click?.();
+        }
+      }, { platform });
+      log('[humanty] meeting mic unmuted');
+    } catch (e) {
+      log(`[humanty] mic unmute failed (non-fatal): ${String(e)}`);
+    }
+  }
 
   const overlay: HumantyOverlay = {
     config: cfg,
@@ -82,6 +105,7 @@ export function createHumantyOverlay(env: NodeJS.ProcessEnv = process.env): Huma
         onVideo: (h264) => carrier.pushVideo(h264),
       });
       await bridge.start();
+      await unmuteMeetingMic(session.page);
     },
 
     forwardLifecycle(e: LifecycleEvent): void {
