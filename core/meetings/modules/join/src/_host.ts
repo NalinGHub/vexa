@@ -83,6 +83,19 @@ export async function callNeedsHumanHelpCallback(
 export async function stopGoogleRecording(page?: any, botConfig?: BotConfig): Promise<void> {
   await hooks.onStopRecording(page, botConfig as BotConfig);
 }
+
+// HUMANTY-SEAM: the join flow hard-writes checkpoint screenshots under
+// /app/storage/screenshots (present in vexa's VM image). On hosts where /app
+// doesn't exist (bare-metal dev boxes, humanty pods) the FIRST unguarded
+// screenshot throws ENOENT and kills an otherwise healthy join before
+// navigation completes. Ensure the directory once at module load,
+// best-effort; if this fails, individual call sites degrade on their own.
+import { mkdirSync } from "node:fs";
+try {
+  mkdirSync("/app/storage/screenshots", { recursive: true });
+} catch {
+  /* non-fatal */
+}
 export async function stopTeamsRecording(page?: any, botConfig?: BotConfig): Promise<void> {
   await hooks.onStopRecording(page, botConfig as BotConfig);
 }
