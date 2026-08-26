@@ -97,26 +97,20 @@ export class HumantyBridge {
   async startPageAudioCapture(): Promise<void> {
     const page = this.deps.page;
     try {
-      // opus-recorder UMD first (defines window.Recorder), then the tap.
       // Assets resolve relative to THIS module (dist/humanty/ → ../../assets)
       // so the path works both in-image (/opt/...) and from a repo checkout.
       const here = dirname(fileURLToPath(import.meta.url));
       const assets = process.env.HUMANTY_AUDIO_ASSETS
         ?? join(here, '..', '..', 'assets', 'humanty-audio');
-      await page.route('**/__humanty_audio/*', async (route) => {
-        try {
-          const url = new URL(route.request().url());
-          const filename = url.pathname.split('/').pop() || '';
-          // Whitelist to avoid path traversal.
-          if (!/^[A-Za-z0-9._-]+$/.test(filename)) return void route.abort().catch(() => {});
-          const body = readFileSync(join(assets, filename));
-          await route.fulfill({
-            status: 200,
-            contentType: filename.endsWith('.wasm') ? 'application/wasm' : 'application/javascript',
-            body,
-          });
-        } catch { void route.abort().catch(() => {}); }
-      }).catch(() => { /* already routed */ });
+
+      // The ENCODER WORKER cannot ride page.route: AudioWorklet.addModule
+      // fetches bypass Playwright interception (verified 2026-08-26 — route
+      // never fires, worklet load aborts). Hand it to the page as a data URL
+      // through this bridge function instead.
+      const encSrc = readFileSync(join(assets, 'encoderWorker.min.js'), 'utf8');
+      await page.exposeFunction('__humantyGetEncoderUrl', () =>
+        `data:application/javascript;base64,${Buffer.from(encSrc).toString('base64')}`
+      ).catch(() => { /* already exposed */ });
 
       // opus-recorder UMD first (defines window.Recorder), then the tap.
       await page.addScriptTag({

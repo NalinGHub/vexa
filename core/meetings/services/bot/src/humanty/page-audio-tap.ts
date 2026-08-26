@@ -38,23 +38,29 @@ export const PAGE_AUDIO_TAP = String.raw`
     return btoa(s);
   }
 
+  // Element→source bindings survive across retries (an <audio> can only ever
+  // be bound to ONE AudioContext — rebinding throws InvalidAccessError).
+  let sharedCtx = null;
+  let sharedDest = null;
+  const boundEls = new WeakSet();
+
   function collectMeetingAudioStream(audioCtx) {
-    const dest = audioCtx.createMediaStreamDestination();
-    const sources = [];
+    if (!sharedCtx || sharedCtx.state === 'closed') { sharedCtx = audioCtx; }
+    if (!sharedDest) sharedDest = sharedCtx.createMediaStreamDestination();
     const elems = Array.from(document.querySelectorAll('audio,video'));
     for (const el of elems) {
-      if (!(el instanceof HTMLMediaElement)) continue;
+      if (!(el instanceof HTMLMediaElement) || boundEls.has(el)) continue;
       try {
-        const src = audioCtx.createMediaElementSource(el);
-        src.connect(dest);
-        src.connect(audioCtx.destination);
-        sources.push(src);
+        const src = sharedCtx.createMediaElementSource(el);
+        src.connect(sharedDest);
+        src.connect(sharedCtx.destination);
+        boundEls.add(el);
       } catch (e) { /* already wired elsewhere */ }
     }
-    return { stream: dest.stream, sources };
+    return { stream: sharedDest.stream, ctx: sharedCtx };
   }
 
-  function startCapture() {
+  async function startCapture() {
     let audioCtx;
     try { audioCtx = new (w.AudioContext || w.webkitAudioContext)(); }
     catch (e) { console.warn('[humanty-page-audio] no AudioContext', e); return; }
@@ -62,13 +68,22 @@ export const PAGE_AUDIO_TAP = String.raw`
     const { stream } = collectMeetingAudioStream(audioCtx);
     if (!stream.getAudioTracks().length) {
       console.log('[humanty-page-audio] no audio tracks yet, retrying...');
-      setTimeout(() => { try { audioCtx.close(); } catch (e) {} startCapture(); }, 500);
+      setTimeout(() => { startCapture(); }, 500); // keep ctx alive — elements are bound to it
       return;
     }
 
+    // Encoder worker rides a data: URL — AudioWorklet.addModule fetches bypass
+    // Playwright route interception, so the synthetic route cannot serve it.
+    let encUrl = '';
+    try { encUrl = await w.__humantyGetEncoderUrl(); } catch (e) {}
+    if (!encUrl) { console.warn('[humanty-page-audio] no encoder url'); return; }
+
     const rec = new w.Recorder({
       mediaTrackConstraints: false,
-      encoderPath: ENCODER_WORKER_URL,
+      encoderPath: encUrl,
+      // Reuse OUR AudioContext inside the Recorder — its default ctor would
+      // create a second context, and cross-context connects throw.
+      sourceNode: { context: audioCtx },
       bufferLength: Math.round((960 * audioCtx.sampleRate) / 24000),
       encoderFrameSize: 20,
       encoderSampleRate: 24000,
@@ -88,12 +103,11 @@ export const PAGE_AUDIO_TAP = String.raw`
     };
 
     try {
-      if (typeof rec.start === 'function' && rec.start.length >= 1) {
-        rec.start(stream).catch((e) => console.warn('[humanty-page-audio] start failed', e));
-      } else {
-        rec._sourceNode = audioCtx.createMediaStreamSource(stream);
-        rec.start();
-      }
+      // Feed the combined meeting stream without getUserMedia: override the
+      // lib's initSourceNode to hand back our own MediaStreamAudioSourceNode.
+      const sourceNode = (sharedCtx || audioCtx).createMediaStreamSource(stream);
+      rec.initSourceNode = async () => { rec.sourceNode = sourceNode; };
+      await rec.start();
       w.__humanty_audioRec = rec;
       w.__humanty_audioCtx = audioCtx;
       console.log('[humanty-page-audio] capture started, sample_rate=', audioCtx.sampleRate);
