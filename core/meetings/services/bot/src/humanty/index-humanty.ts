@@ -73,7 +73,13 @@ export function createHumantyOverlay(platform: string, env: NodeJS.ProcessEnv = 
   async function unmuteMeetingMic(page: import('playwright').Page): Promise<void> {
     try {
       await page.evaluate(({ platform }) => {
-        const doc = (globalThis as unknown as { document?: { querySelector(sel: string): Element | null; querySelectorAll(sel: string): ArrayLike<Element & { click?(): void; getAttribute(name: string): string | null }> } }).document;
+        // Structural shapes only — this package compiles without DOM libs.
+        const doc = (globalThis as unknown as {
+          document?: {
+            querySelector(sel: string): { click(): void } | null;
+            querySelectorAll(sel: string): ArrayLike<{ click?(): void; getAttribute(name: string): string | null }>;
+          };
+        }).document;
         const click = (sel: string): void => { doc?.querySelector(sel)?.click(); };
         if (platform === 'teams') click('#microphone-button');
         else if (platform === 'zoom') click('.join-audio-container__btn');
