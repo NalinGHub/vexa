@@ -101,10 +101,21 @@ try {
   });
   assert(pixel[0] + pixel[1] + pixel[2] > 100,
     `decoded frame remained black: rgba=${pixel.join(',')}`);
-  await Promise.race([
-    turnPlayedPromise,
-    new Promise<never>((_, reject) => setTimeout(() => reject(new Error('turn paint ACK timed out')), 5_000)),
-  ]);
+  // The streaming ffmpeg decoder retains a tail until the next H.264 batch.
+  // A following silence/video batch must advance the paint fence for turn_end.
+  carrier.pushVideo(encoded.stdout, 50);
+  try {
+    await Promise.race([
+      turnPlayedPromise,
+      new Promise<never>((_, reject) => setTimeout(() => reject(new Error('turn paint ACK timed out')), 5_000)),
+    ]);
+  } catch (error) {
+    const stats = await page.evaluate(() =>
+      (window as unknown as { __humanty_camera_stats?: unknown }).__humanty_camera_stats);
+    console.error('turn ACK camera stats:', stats);
+    console.error(pageMessages.join('\n'));
+    throw error;
+  }
   assert.equal(turnPlayed, true);
 } finally {
   await carrier?.stop();

@@ -21,7 +21,7 @@ import type { BrowserSession } from '../capture-bridge.js';
 import type { LifecycleEvent } from '../contracts.js';
 import { loadHumantyConfig, type HumantyConfig } from './config.js';
 import { HumantyBridge } from './humanty-bridge.js';
-import { createVideoCarrier, type VideoCarrier } from './video-carrier.js';
+import { createVideoCarrier, PAGE_VIDEO_CARRIER, type VideoCarrier } from './video-carrier.js';
 
 const log = (m: string): void => console.log(`[bot] ${m}`);
 
@@ -45,9 +45,8 @@ function lifecycleToInternal(e: LifecycleEvent): { event: string; message?: stri
 
 export interface HumantyOverlay {
   readonly config: HumantyConfig;
-  /** Value to append to the browser launch args (--use-file-for-fake-video-capture=…),
-   *  or null when disabled. Read by index.ts BEFORE launchBrowser(). */
-  readonly cameraArg: string | null;
+  /** Document-start canvas camera + WebCodecs decoder, installed before navigation. */
+  readonly cameraInitScript: string;
   /** Wire the bridge against the live session. Resolves once both WS connections are up;
    *  never throws (a failed bridge degrades to a transcription-only bot, loudly logged). */
   start(session: BrowserSession): Promise<void>;
@@ -63,60 +62,76 @@ export function createHumantyOverlay(platform: string, env: NodeJS.ProcessEnv = 
   const cfg = loadHumantyConfig(env);
   if (!cfg.enabled) return null;
 
-  const carrier: VideoCarrier = createVideoCarrier(log);
   let bridge: HumantyBridge | null = null;
+  let carrier: VideoCarrier | null = null;
+  let page: BrowserSession['page'] | null = null;
+  let inMeetingStarted = false;
   let stopped = false;
 
-  /** Unmute the meeting-UI mic ONCE after admission (upstream joins muted; vexa's
-   *  per-speak unmute is act-driven which humanty bypasses). Between avatar turns the
-   *  PulseAudio chain is level-muted, so the open mic only ever carries our bursts. */
-  async function unmuteMeetingMic(page: import('playwright').Page): Promise<void> {
+  /** Upstream joins with mic + camera off. Turn both on only after admission,
+   *  then attach the page-audio tap to the stable in-meeting document. */
+  async function startInMeetingMedia(livePage: import('playwright').Page): Promise<void> {
     try {
-      await page.evaluate(({ platform }) => {
+      const enabled = await livePage.evaluate(({ platform }) => {
         // Structural shapes only — this package compiles without DOM libs.
         const doc = (globalThis as unknown as {
           document?: {
-            querySelector(sel: string): { click(): void } | null;
-            querySelectorAll(sel: string): ArrayLike<{ click?(): void; getAttribute(name: string): string | null }>;
+            querySelectorAll(sel: string): ArrayLike<{
+              click?(): void;
+              getAttribute(name: string): string | null;
+            }>;
           };
+          __humanty_activateCamera?: () => Promise<number>;
         }).document;
-        const click = (sel: string): void => { doc?.querySelector(sel)?.click(); };
-        if (platform === 'teams') click('#microphone-button');
-        else if (platform === 'zoom') click('.join-audio-container__btn');
-        else {
-          // Google Meet / Jitsi: aria-label match ("microphone" / "Toggle mute audio").
-          const btns = Array.from(doc?.querySelectorAll('[role="button"],button') ?? []);
-          const btn = btns.find((b) => /microphone|mute audio/i.test(b.getAttribute('aria-label') ?? ''));
-          btn?.click?.();
+        const root = globalThis as unknown as { __humanty_activateCamera?: () => Promise<number> };
+        const buttons = Array.from(doc?.querySelectorAll('[role="button"],button') ?? []);
+        let mic = false;
+        let camera = false;
+        for (const button of buttons) {
+          const label = button.getAttribute('aria-label') ?? '';
+          if (!mic && /turn on microphone|unmute microphone|microphone off/i.test(label)) {
+            button.click?.();
+            mic = true;
+          }
+          if (!camera && /turn on camera|start video|camera off/i.test(label)) {
+            button.click?.();
+            camera = true;
+          }
         }
+        return root.__humanty_activateCamera?.().then((replaced) => ({ mic, camera, replaced }))
+          ?? Promise.resolve({ mic, camera, replaced: 0, platform });
       }, { platform });
-      log('[humanty] meeting mic unmuted');
+      log(`[humanty] in-meeting media enabled (mic=${enabled.mic}, camera=${enabled.camera}, repaired_senders=${enabled.replaced})`);
     } catch (e) {
-      log(`[humanty] mic unmute failed (non-fatal): ${String(e)}`);
+      log(`[humanty] in-meeting media enable failed (non-fatal): ${String(e)}`);
     }
+    await bridge?.startPageAudioCapture();
   }
 
   const overlay: HumantyOverlay = {
     config: cfg,
-    cameraArg: `--use-file-for-fake-video-capture=${carrier.captureArg}`,
+    cameraInitScript: PAGE_VIDEO_CARRIER,
 
     async start(session: BrowserSession): Promise<void> {
       if (stopped) return;
+      page = session.page;
+      carrier = createVideoCarrier(session.page, log);
       bridge = new HumantyBridge(cfg, {
         page: session.page,
         log,
         onReady: () => log('[humanty] avatar pipeline ready'),
         onError: (msg) => log(`[humanty] degraded: ${msg} (interview continues audio-only)`),
-        // Demuxed avatar video → the fake-camera carrier (Chromium reads it as the cam).
-        onVideo: (h264) => carrier.pushVideo(h264),
+        onVideo: (h264, frameCount) => carrier?.pushVideo(h264, frameCount),
+        onTurnEnd: (acknowledge) => carrier?.tagTurnEnd(acknowledge),
       });
       await bridge.start();
-      await unmuteMeetingMic(session.page);
-      // Ears: tap the live meeting page for audio → /v1/realtime (brain).
-      await bridge.startPageAudioCapture();
     },
 
     forwardLifecycle(e: LifecycleEvent): void {
+      if (e.status === 'active' && page && !inMeetingStarted) {
+        inMeetingStarted = true;
+        void startInMeetingMedia(page);
+      }
       const { event, message } = lifecycleToInternal(e);
       if (!event || !cfg.baseUrl) return;
       const httpBase = cfg.baseUrl.replace(/^ws/, 'http');
@@ -131,7 +146,7 @@ export function createHumantyOverlay(platform: string, env: NodeJS.ProcessEnv = 
       if (stopped) return;
       stopped = true;
       await bridge?.stop().catch(() => {});
-      await carrier.stop().catch(() => {});
+      await carrier?.stop().catch(() => {});
     },
   };
 

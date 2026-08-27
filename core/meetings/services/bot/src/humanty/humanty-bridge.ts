@@ -18,9 +18,10 @@
  *
  * Video (avatar lip-synced video with the answer audio muxed inside):
  *   ws://<base>/v1/video/stream
- *   server → binary v2/v3 packets:
+ *   server → binary v2/v3/v4 packets:
  *     v2: [1B 0x02][2B au_count][4B vlen][4B alen][1B rid_len][8B pts] + rid + H264 + OggOpus
  *     v3: same plus [8B batch_ts_us][4B frame_dur_us] before rid
+ *     v4: v3 without batch_ts_us, plus [2B metadata_len] and trailing metadata
  *   we demux: H.264 → onVideo callback (the fake-camera carrier);
  *             Ogg-Opus → ffmpeg → s16le 24k mono → paplay → tts_sink.
  */
@@ -35,6 +36,39 @@ import { PAGE_AUDIO_TAP } from './page-audio-tap.js';
 
 const SAMPLE_RATE = 24000;
 const CHANNELS = 1;
+
+export interface MuxedFrame {
+  frameCount: number;
+  requestId: string;
+  video: Buffer;
+  audio: Buffer;
+}
+
+/** Parse one complete backend mux packet. Payload slices share the input buffer. */
+export function parseMuxedFrame(buf: Buffer): MuxedFrame | null {
+  if (buf.length < 20) return null;
+  const type = buf[0];
+  const headerSize = type === 0x02 ? 20 : type === 0x03 ? 32 : type === 0x04 ? 26 : 0;
+  if (headerSize === 0 || buf.length < headerSize) return null;
+
+  const frameCount = buf.readUInt16BE(1);
+  const videoLength = buf.readUInt32BE(3);
+  const audioLength = buf.readUInt32BE(7);
+  const requestIdLength = buf[11];
+  const metadataLength = type === 0x04 ? buf.readUInt16BE(24) : 0;
+  const payloadStart = headerSize + requestIdLength;
+  const payloadEnd = payloadStart + videoLength + audioLength + metadataLength;
+  if (payloadEnd > buf.length) return null;
+
+  return {
+    frameCount,
+    requestId: requestIdLength > 0
+      ? buf.subarray(headerSize, headerSize + requestIdLength).toString('utf8')
+      : '',
+    video: buf.subarray(payloadStart, payloadStart + videoLength),
+    audio: buf.subarray(payloadStart + videoLength, payloadStart + videoLength + audioLength),
+  };
+}
 
 function pactl(args: string, log: (m: string) => void): void {
   try {
@@ -52,8 +86,10 @@ export interface HumantyBridgeDeps {
   /** Called on an unrecoverable bridge fault AFTER start() resolved (post-admission
    *  subsystem faults must degrade loudly but never crash the orchestrator — #593). */
   onError?: (msg: string) => void;
-  /** Receives every demuxed H.264 frame run (routed to the fake-camera carrier). */
-  onVideo?: (h264: Buffer) => void;
+  /** Receives each demuxed Annex-B H.264 run for the canvas camera carrier. */
+  onVideo?: (h264: Buffer, frameCount: number) => void;
+  /** Defers a turn acknowledgement until the carrier has painted its preceding batch. */
+  onTurnEnd?: (acknowledge: () => void) => void;
   log: (m: string) => void;
 }
 
@@ -67,7 +103,6 @@ export class HumantyBridge {
   /** ffmpeg child demuxing+decoding Ogg-Opus → raw PCM into paplay's stdin. */
   private ffmpegProc: ChildProcess | null = null;
 
-  private currentReqId = '';
   private stopping = false;
   private readySignalled = false;
   private started = false;
@@ -77,7 +112,7 @@ export class HumantyBridge {
     this.deps = deps;
   }
 
-    async start(): Promise<void> {
+  async start(): Promise<void> {
     if (this.started) return;
     this.started = true;
     await this.exposePageHooks();
@@ -242,8 +277,24 @@ export class HumantyBridge {
   }
 
   private handleVideoControl(raw: string): void {
-    let ev: { status?: string; message?: string };
+    let ev: { type?: string; turn_id?: string; status?: string; message?: string };
     try { ev = JSON.parse(raw); } catch { return; }
+    if (ev.type === 'unmute.video.turn_end' && typeof ev.turn_id === 'string' && ev.turn_id) {
+      const turnId = ev.turn_id;
+      let acknowledged = false;
+      const acknowledge = (): void => {
+        if (acknowledged) return;
+        acknowledged = true;
+        this.ackTurnPlayed(turnId);
+      };
+      try {
+        if (this.deps.onTurnEnd) this.deps.onTurnEnd(acknowledge);
+        else acknowledge();
+      } catch {
+        acknowledge();
+      }
+      return;
+    }
     if ((ev.status === 'ready' || ev.status === 'unavailable' || ev.status === 'disabled') && !this.readySignalled) {
       // Ready ⇒ avatar live; unavailable/disabled ⇒ proceed without video rather than
       // stalling the interview. Either way the meeting can start.
@@ -254,54 +305,20 @@ export class HumantyBridge {
   }
 
   /**
-   * Demux one v2/v3 packet into H.264 bytes (→ page) and Ogg-Opus bytes (→ paplay).
-   * See header comment for the wire layout. Turn boundaries are detected by req_id change
-   * and ACKed so the backend's queue keeps flowing (unmute.video.turn_played).
+   * Demux one v2/v3/v4 packet into H.264 bytes (to page) and Ogg-Opus bytes (to paplay).
+   * Turn boundaries arrive as explicit text control messages; request IDs can span turns.
    */
   private handleMuxedFrame(buf: Buffer): void {
-    if (buf.length < 20) return;
-    const t = buf[0];
-    if (t !== 0x02 && t !== 0x03) return;
-    const v3 = t === 0x03;
-    const headerFixed = v3 ? 32 : 20;
-    if (buf.length < headerFixed) return;
-
-    const vlen = buf.readUInt32BE(3);
-    const alen = buf.readUInt32BE(7);
-    const ridLen = buf[11];
-    const headerSize = headerFixed + ridLen;
-    if (buf.length < headerSize + vlen + alen) {
-      this.deps.log('[humanty] truncated v2/v3 packet, dropping');
+    const frame = parseMuxedFrame(buf);
+    if (!frame) {
+      this.deps.log('[humanty] unsupported or truncated mux packet, dropping');
       return;
     }
-    const rid = ridLen > 0 ? buf.subarray(headerFixed, headerFixed + ridLen).toString('utf8') : '';
-    const videoBytes = buf.subarray(headerSize, headerSize + vlen);
-    const audioBytes = buf.subarray(headerSize + vlen, headerSize + vlen + alen);
 
-    if (rid && rid !== this.currentReqId) {
-      const prev = this.currentReqId;
-      this.currentReqId = rid;
-      if (prev) this.ackTurnPlayed(prev);
+    if (frame.video.length > 0) {
+      this.deps.onVideo?.(frame.video, frame.frameCount);
     }
-
-    if (vlen > 0) {
-      this.deps.onVideo?.(videoBytes);
-      void this.pushVideoToPage(videoBytes);
-    }
-    if (alen > 0) this.feedOggOpus(audioBytes);
-  }
-
-  private async pushVideoToPage(videoBytes: Buffer): Promise<void> {
-    try {
-      // Playwright serializes the typed array across the bridge as ArrayBuffer.
-      await this.deps.page.evaluate((bytes: number[]) => {
-        const w = globalThis as unknown as { __humanty_pushVideo?: (a: ArrayBuffer) => void };
-        w.__humanty_pushVideo?.(new Uint8Array(bytes).buffer);
-      }, Array.from(videoBytes));
-    } catch (e) {
-      // Page may be mid-navigation; tolerate transient failures.
-      this.deps.log(`[humanty] pushVideoToPage err: ${String(e)}`);
-    }
+    if (frame.audio.length > 0) this.feedOggOpus(frame.audio);
   }
 
   private ackTurnPlayed(turnId: string): void {
@@ -332,7 +349,6 @@ export class HumantyBridge {
         ws.send(JSON.stringify({ type: 'unmute.video.flush_queue' }));
       } catch { /* ignore */ }
     }
-    this.currentReqId = '';
   }
 
   /**
@@ -369,6 +385,7 @@ export class HumantyBridge {
       '--device=tts_sink',
     ], { stdio: ['pipe', 'ignore', 'pipe'] });
     ff.stdout.pipe(paplay.stdin);
+    ff.stdout.once('data', () => log('[humanty] answer PCM reached paplay'));
     ff.on('error', (e) => log(`[humanty] ffmpeg spawn failed: ${e.message}`));
     paplay.on('error', (e) => log(`[humanty] paplay spawn failed: ${e.message}`));
     paplay.stderr?.on('data', () => { /* noisy; failures surface as silence + exit */ });
