@@ -68,6 +68,26 @@ export function createHumantyOverlay(platform: string, env: NodeJS.ProcessEnv = 
   let inMeetingStarted = false;
   let stopped = false;
   let lifecycleEventSeq = 0;
+  let bridgeStartFailures = 0;
+  let bridgeRetryTimer: ReturnType<typeof setTimeout> | null = null;
+
+  async function startBridgeWithRetry(): Promise<void> {
+    const activeBridge = bridge;
+    if (!activeBridge || stopped) return;
+    try {
+      await activeBridge.start();
+      bridgeStartFailures = 0;
+    } catch (error) {
+      bridgeStartFailures++;
+      log(`[humanty] bridge start failed (attempt ${bridgeStartFailures}/3): ${String(error)}`);
+      if (stopped || activeBridge !== bridge || bridgeStartFailures >= 3 || bridgeRetryTimer) return;
+      bridgeRetryTimer = setTimeout(() => {
+        bridgeRetryTimer = null;
+        void startBridgeWithRetry();
+      }, 1_000);
+      bridgeRetryTimer.unref?.();
+    }
+  }
 
   /** Upstream joins with mic + camera off. Turn both on only after admission,
    *  then attach the page-audio tap to the stable in-meeting document. */
@@ -125,7 +145,7 @@ export function createHumantyOverlay(platform: string, env: NodeJS.ProcessEnv = 
         onVideo: (h264, frameCount) => carrier?.pushVideo(h264, frameCount),
         onTurnEnd: (acknowledge) => carrier?.tagTurnEnd(acknowledge),
       });
-      await bridge.start();
+      await startBridgeWithRetry();
     },
 
     forwardLifecycle(e: LifecycleEvent): void {
@@ -151,6 +171,8 @@ export function createHumantyOverlay(platform: string, env: NodeJS.ProcessEnv = 
     async stop(): Promise<void> {
       if (stopped) return;
       stopped = true;
+      if (bridgeRetryTimer) clearTimeout(bridgeRetryTimer);
+      bridgeRetryTimer = null;
       await bridge?.stop().catch(() => {});
       await carrier?.stop().catch(() => {});
     },

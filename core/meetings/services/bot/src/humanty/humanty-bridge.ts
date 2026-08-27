@@ -36,6 +36,12 @@ import { PAGE_AUDIO_TAP } from './page-audio-tap.js';
 
 const SAMPLE_RATE = 24000;
 const CHANNELS = 1;
+const MAX_PAGE_AUDIO_BASE64_CHARS = 512 * 1024;
+const MAX_REALTIME_BUFFERED_BYTES = 1024 * 1024;
+const MAX_REALTIME_PAYLOAD_BYTES = 1024 * 1024;
+const MAX_VIDEO_PAYLOAD_BYTES = 16 * 1024 * 1024;
+const MAX_OGG_CHUNK_BYTES = 4 * 1024 * 1024;
+const DEFAULT_WS_OPEN_TIMEOUT_MS = 5_000;
 
 export interface MuxedFrame {
   frameCount: number;
@@ -90,6 +96,13 @@ export interface HumantyBridgeDeps {
   onVideo?: (h264: Buffer, frameCount: number) => void;
   /** Defers a turn acknowledgement until the carrier has painted its preceding batch. */
   onTurnEnd?: (acknowledge: () => void) => void;
+  /** Test/operations seam for bounded websocket opening. */
+  wsOpenTimeoutMs?: number;
+  createWebSocket?: (
+    url: string,
+    protocols: string[],
+    options: { maxPayload: number },
+  ) => WebSocket;
   log: (m: string) => void;
 }
 
@@ -103,9 +116,11 @@ export class HumantyBridge {
   /** ffmpeg child demuxing+decoding Ogg-Opus → raw PCM into paplay's stdin. */
   private ffmpegProc: ChildProcess | null = null;
 
+  private startPromise: Promise<void> | null = null;
+  private audioInputBlocked = false;
   private stopping = false;
   private readySignalled = false;
-  private started = false;
+  private expectedSocketCloses = new WeakSet<WebSocket>();
 
   constructor(cfg: HumantyConfig, deps: HumantyBridgeDeps) {
     this.cfg = cfg;
@@ -113,12 +128,21 @@ export class HumantyBridge {
   }
 
   async start(): Promise<void> {
-    if (this.started) return;
-    this.started = true;
-    await this.exposePageHooks();
-    await this.connectRealtime();
-    await this.connectVideo();
-    this.deps.log('[humanty] both WS connections open');
+    if (this.stopping) throw new Error('humanty bridge is stopping');
+    if (!this.startPromise) {
+      const attempt = (async () => {
+        await this.exposePageHooks();
+        await this.connectRealtime();
+        await this.connectVideo();
+        this.deps.log('[humanty] both WS connections open');
+      })();
+      this.startPromise = attempt.catch(async (error) => {
+        await this.rollbackStart();
+        this.startPromise = null;
+        throw error;
+      });
+    }
+    await this.startPromise;
   }
 
   /**
@@ -163,15 +187,40 @@ export class HumantyBridge {
 
   /** Idempotent, never throws — safe to call from any teardown path (#593). */
   async stop(): Promise<void> {
-    if (!this.started || this.stopping) return;
+    if (this.stopping) return;
     this.stopping = true;
+    await this.deps.page.evaluate(async () => {
+      const stopAudio = (globalThis as unknown as {
+        __humanty_stopAudioCapture?: () => Promise<void>;
+      }).__humanty_stopAudioCapture;
+      await stopAudio?.();
+    }).catch(() => { /* page may already be closed */ });
     this.endActivePaplay();
-    for (const ws of [this.rt, this.vid]) {
-      try { ws?.close(1000, 'bridge stop'); } catch { /* best-effort */ }
-    }
+    this.closeSockets('bridge stop');
+    this.deps.log('[humanty] stopped');
+  }
+
+  private closeSocket(ws: WebSocket | null, reason: string): void {
+    if (!ws) return;
+    this.expectedSocketCloses.add(ws);
+    try {
+      if (ws.readyState === WebSocket.CONNECTING) ws.terminate();
+      else if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CLOSING) {
+        ws.close(1000, reason);
+      }
+    } catch { /* best-effort */ }
+  }
+
+  private closeSockets(reason: string): void {
+    this.closeSocket(this.rt, reason);
+    this.closeSocket(this.vid, reason);
     this.rt = null;
     this.vid = null;
-    this.deps.log('[humanty] stopped');
+  }
+
+  private async rollbackStart(): Promise<void> {
+    this.closeSockets('bridge start rollback');
+    this.endActivePaplay();
   }
 
   // ────────────────── page hooks ──────────────────
@@ -179,8 +228,10 @@ export class HumantyBridge {
   private async exposePageHooks(): Promise<void> {
     await this.deps.page.exposeFunction('__humanty_pushOpus', (b64: string) => {
       if (this.stopping) return;
+      if (b64.length > MAX_PAGE_AUDIO_BASE64_CHARS) return;
       const ws = this.rt;
       if (!ws || ws.readyState !== WebSocket.OPEN) return;
+      if (ws.bufferedAmount > MAX_REALTIME_BUFFERED_BYTES) return;
       try { ws.send(JSON.stringify({ type: 'input_audio_buffer.append', audio: b64 })); }
       catch (e) { this.deps.log(`[humanty] push audio failed: ${String(e)}`); }
     }).catch((e) => { this.deps.log(`[humanty] expose __humanty_pushOpus failed: ${String(e)}`); });
@@ -188,31 +239,78 @@ export class HumantyBridge {
 
   // ────────────────── realtime ws ──────────────────
 
-  private connectRealtime(): Promise<void> {
-    const url = `${this.cfg.baseUrl}/v1/realtime`;
+  private createSocket(url: string, protocols: string[], maxPayload: number): WebSocket {
+    return this.deps.createWebSocket?.(url, protocols, { maxPayload })
+      ?? new WebSocket(url, protocols, { maxPayload });
+  }
+
+  private openSocket(
+    kind: 'realtime' | 'video',
+    url: string,
+    protocols: string[],
+    maxPayload: number,
+  ): Promise<void> {
     return new Promise((resolve, reject) => {
-      const ws = new WebSocket(url, ['realtime']);
+      const ws = this.createSocket(url, protocols, maxPayload);
+      if (kind === 'realtime') this.rt = ws;
+      else this.vid = ws;
+
       let opened = false;
+      let settled = false;
+      const settleReject = (error: Error): void => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timeout);
+        reject(error);
+      };
+      const timeout = setTimeout(() => {
+        settleReject(new Error(`${kind} ws open timed out`));
+        this.expectedSocketCloses.add(ws);
+        try { ws.terminate(); } catch { /* best-effort */ }
+      }, this.deps.wsOpenTimeoutMs ?? DEFAULT_WS_OPEN_TIMEOUT_MS);
+      timeout.unref?.();
+
       ws.on('open', () => {
+        if (settled || this.stopping) return;
         opened = true;
-        this.rt = ws;
-        this.sendSessionUpdate();
-        this.deps.log('[humanty] /v1/realtime open');
+        settled = true;
+        clearTimeout(timeout);
+        if (kind === 'realtime') {
+          this.sendSessionUpdate();
+          this.deps.log('[humanty] /v1/realtime open');
+        } else {
+          this.deps.log('[humanty] /v1/video/stream open');
+        }
         resolve();
       });
       ws.on('message', (data, isBinary) => {
-        if (!isBinary) this.handleRealtimeMessage(String(data));
+        if (kind === 'realtime') {
+          if (!isBinary) this.handleRealtimeMessage(String(data));
+        } else if (!isBinary) {
+          this.handleVideoControl(String(data));
+        } else {
+          this.handleMuxedFrame(data as Buffer);
+        }
       });
       ws.on('close', (code) => {
-        if (this.rt === ws) this.rt = null;
-        if (!opened) reject(new Error(`realtime ws closed before open: ${code}`));
-        else if (!this.stopping) this.fail('realtime ws closed unexpectedly');
+        if (kind === 'realtime' && this.rt === ws) this.rt = null;
+        if (kind === 'video' && this.vid === ws) this.vid = null;
+        if (!opened) settleReject(new Error(`${kind} ws closed before open: ${code}`));
+        else if (!this.stopping && !this.expectedSocketCloses.has(ws)) {
+          this.fail(`${kind} ws closed unexpectedly`);
+        }
       });
-      ws.on('error', (err) => {
-        if (!opened) reject(err);
-        else this.deps.log(`[humanty] /v1/realtime error: ${err.message}`);
+      ws.on('error', (error) => {
+        const err = error instanceof Error ? error : new Error(String(error));
+        if (!opened) settleReject(err);
+        else this.deps.log(`[humanty] /v1/${kind} error: ${err.message}`);
       });
     });
+  }
+
+  private connectRealtime(): Promise<void> {
+    const url = `${this.cfg.baseUrl}/v1/realtime`;
+    return this.openSocket('realtime', url, ['realtime'], MAX_REALTIME_PAYLOAD_BYTES);
   }
 
   private sendSessionUpdate(): void {
@@ -250,30 +348,9 @@ export class HumantyBridge {
 
   private connectVideo(): Promise<void> {
     const url = `${this.cfg.baseUrl}/v1/video/stream`;
-    return new Promise((resolve, reject) => {
-      const ws = new WebSocket(url);
-      ws.binaryType = 'nodebuffer';
-      let opened = false;
-      ws.on('open', () => {
-        opened = true;
-        this.vid = ws;
-        this.deps.log('[humanty] /v1/video/stream open');
-        resolve();
-      });
-      ws.on('message', (data, isBinary) => {
-        if (!isBinary) { this.handleVideoControl(String(data)); return; }
-        this.handleMuxedFrame(data as Buffer);
-      });
-      ws.on('close', (code) => {
-        if (this.vid === ws) this.vid = null;
-        if (!opened) reject(new Error(`video ws closed before open: ${code}`));
-        else if (!this.stopping) this.fail('video ws closed unexpectedly');
-      });
-      ws.on('error', (err) => {
-        if (!opened) reject(err);
-        else this.deps.log(`[humanty] /v1/video/stream error: ${err.message}`);
-      });
-    });
+    const opening = this.openSocket('video', url, [], MAX_VIDEO_PAYLOAD_BYTES);
+    if (this.vid) this.vid.binaryType = 'nodebuffer';
+    return opening;
   }
 
   private handleVideoControl(raw: string): void {
@@ -329,11 +406,14 @@ export class HumantyBridge {
   // ────────────────── audio decode + paplay ──────────────────
 
   private endActivePaplay(): void {
-    const proc = this.paplayProc;
-    if (proc) {
-      try { proc.stdin?.destroy(); } catch { /* ignore */ }
-      try { proc.kill('SIGKILL'); } catch { /* ignore */ }
-      this.paplayProc = null;
+    const decoder = this.ffmpegProc;
+    const player = this.paplayProc;
+    this.ffmpegProc = null;
+    this.paplayProc = null;
+    this.audioInputBlocked = false;
+    for (const proc of [decoder, player]) {
+      try { proc?.stdin?.destroy(); } catch { /* ignore */ }
+      try { proc?.kill('SIGKILL'); } catch { /* ignore */ }
     }
     pactl('set-sink-mute tts_sink 1', this.deps.log);
     pactl('set-source-mute virtual_mic 1', this.deps.log);
@@ -358,11 +438,12 @@ export class HumantyBridge {
    * the next audio chunk starts a fresh pipeline.
    */
   private feedOggOpus(audio: Buffer): void {
-    if (this.stopping || audio.length === 0) return;
+    if (this.stopping || audio.length === 0 || audio.length > MAX_OGG_CHUNK_BYTES) return;
     if (!this.ffmpegProc && !this.paplayProc) this.ensureDecoderPipeline();
     const dec = this.ffmpegProc, sink = this.paplayProc;
-    if (!dec?.stdin || dec.stdin.destroyed || !sink?.stdin || sink.stdin.destroyed) return;
-    try { dec.stdin.write(audio); } catch { /* decoder mid-restart; drop */ }
+    if (this.audioInputBlocked || !dec?.stdin || dec.stdin.destroyed || !sink?.stdin || sink.stdin.destroyed) return;
+    try { this.audioInputBlocked = !dec.stdin.write(audio); }
+    catch { /* decoder mid-restart; drop */ }
   }
 
   private ensureDecoderPipeline(): void {
@@ -386,11 +467,16 @@ export class HumantyBridge {
     ], { stdio: ['pipe', 'ignore', 'pipe'] });
     ff.stdout.pipe(paplay.stdin);
     ff.stdout.once('data', () => log('[humanty] answer PCM reached paplay'));
+    ff.stdin.on('error', () => { /* decoder exited between packets */ });
+    ff.stdin.on('drain', () => { this.audioInputBlocked = false; });
     ff.on('error', (e) => log(`[humanty] ffmpeg spawn failed: ${e.message}`));
     paplay.on('error', (e) => log(`[humanty] paplay spawn failed: ${e.message}`));
     paplay.stderr?.on('data', () => { /* noisy; failures surface as silence + exit */ });
     ff.on('exit', () => {
-      if (this.ffmpegProc === ff) this.ffmpegProc = null;
+      if (this.ffmpegProc === ff) {
+        this.ffmpegProc = null;
+        this.audioInputBlocked = false;
+      }
       try { paplay.kill('SIGTERM'); } catch { /* ignore */ }
       this.paplayProc = null;
     });

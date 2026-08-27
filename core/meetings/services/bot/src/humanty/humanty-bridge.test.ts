@@ -133,7 +133,7 @@ class FakeSocket extends EventEmitter {
 const sockets: FakeSocket[] = [];
 let rejectFirstVideo = true;
 const retryBridge = new HumantyBridge(cfg, {
-  page: { exposeFunction: async () => {} } as unknown as Page,
+  page: { exposeFunction: async () => {}, evaluate: async () => {} } as unknown as Page,
   log: () => {},
   wsOpenTimeoutMs: 50,
   createWebSocket: (url) => {

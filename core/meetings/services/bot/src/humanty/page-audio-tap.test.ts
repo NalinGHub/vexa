@@ -75,7 +75,7 @@ try {
   const stopped = await page.evaluate(async () => {
     const stop = (window as unknown as { __humanty_stopAudioCapture?: () => Promise<void> })
       .__humanty_stopAudioCapture;
-    assert(stop);
+    if (!stop) throw new Error('audio stop hook missing');
     await stop();
     document.body.appendChild(document.createElement('audio'));
     await new Promise((resolve) => setTimeout(resolve, 20));

@@ -16,6 +16,9 @@ export const PAGE_AUDIO_TAP = String.raw`
   if (w.__humanty_audioInstalled) return;
 
   const ENCODER_WORKER_URL = '/__humanty_audio/encoderWorker.min.js';
+  const MAX_OPUS_CHUNK_BYTES = 256 * 1024;
+  let readyTimer = null;
+  let stopped = false;
 
   // opus-recorder UMD is injected before this script by the bridge.
   function whenReady(cb) {
@@ -26,7 +29,7 @@ export const PAGE_AUDIO_TAP = String.raw`
         console.warn('[humanty-page-audio] giving up waiting for Recorder/document');
         return;
       }
-      setTimeout(tick, 100);
+       readyTimer = setTimeout(tick, 100);
     };
     tick();
   }
@@ -43,34 +46,53 @@ export const PAGE_AUDIO_TAP = String.raw`
   let sharedCtx = null;
   let sharedDest = null;
   const boundEls = new WeakSet();
+  const boundNodes = new Set();
+  let observer = null;
+  let recorder = null;
+  let pushInFlight = false;
 
-  function collectMeetingAudioStream(audioCtx) {
-    if (!sharedCtx || sharedCtx.state === 'closed') { sharedCtx = audioCtx; }
-    if (!sharedDest) sharedDest = sharedCtx.createMediaStreamDestination();
-    const elems = Array.from(document.querySelectorAll('audio,video'));
-    for (const el of elems) {
-      if (!(el instanceof HTMLMediaElement) || boundEls.has(el)) continue;
-      try {
-        const src = sharedCtx.createMediaElementSource(el);
-        src.connect(sharedDest);
-        src.connect(sharedCtx.destination);
-        boundEls.add(el);
-      } catch (e) { /* already wired elsewhere */ }
+  function bindElement(el) {
+    if (!sharedCtx || !sharedDest || !(el instanceof HTMLMediaElement) || boundEls.has(el)) return;
+    try {
+      const src = sharedCtx.createMediaElementSource(el);
+      src.connect(sharedDest);
+      src.connect(sharedCtx.destination);
+      boundEls.add(el);
+      boundNodes.add(src);
+    } catch (e) { /* already wired elsewhere */ }
+  }
+
+  function scanMedia(root) {
+    if (root instanceof HTMLMediaElement) bindElement(root);
+    if (root && typeof root.querySelectorAll === 'function') {
+      for (const el of root.querySelectorAll('audio,video')) bindElement(el);
     }
-    return { stream: sharedDest.stream, ctx: sharedCtx };
+  }
+
+  function observeLateMedia() {
+    if (observer || stopped) return;
+    observer = new MutationObserver((records) => {
+      for (const record of records) {
+        for (const node of record.addedNodes) scanMedia(node);
+      }
+    });
+    observer.observe(document.documentElement || document, { childList: true, subtree: true });
   }
 
   async function startCapture() {
-    let audioCtx;
-    try { audioCtx = new (w.AudioContext || w.webkitAudioContext)(); }
+    let audioCtx = sharedCtx;
+    try {
+      if (!audioCtx || audioCtx.state === 'closed') {
+        audioCtx = new (w.AudioContext || w.webkitAudioContext)();
+        sharedCtx = audioCtx;
+      }
+    }
     catch (e) { console.warn('[humanty-page-audio] no AudioContext', e); return; }
 
-    const { stream } = collectMeetingAudioStream(audioCtx);
-    if (!stream.getAudioTracks().length) {
-      console.log('[humanty-page-audio] no audio tracks yet, retrying...');
-      setTimeout(() => { startCapture(); }, 500); // keep ctx alive — elements are bound to it
-      return;
-    }
+    if (!sharedDest) sharedDest = audioCtx.createMediaStreamDestination();
+    observeLateMedia();
+    scanMedia(document);
+    const stream = sharedDest.stream;
 
     // Encoder worker rides a data: URL — AudioWorklet.addModule fetches bypass
     // Playwright route interception, so the synthetic route cannot serve it.
@@ -96,10 +118,14 @@ export const PAGE_AUDIO_TAP = String.raw`
       streamPages: true,
     });
 
-    rec.ondataavailable = (chunk) => {
+    rec.ondataavailable = async (chunk) => {
+      if (stopped || pushInFlight || !chunk || chunk.length > MAX_OPUS_CHUNK_BYTES) return;
       try {
-        if (typeof w.__humanty_pushOpus === 'function') w.__humanty_pushOpus(base64Encode(chunk));
+        if (typeof w.__humanty_pushOpus !== 'function') return;
+        pushInFlight = true;
+        await w.__humanty_pushOpus(base64Encode(chunk));
       } catch (e) { console.warn('[humanty-page-audio] push failed', e); }
+      finally { pushInFlight = false; }
     };
 
     try {
@@ -108,11 +134,32 @@ export const PAGE_AUDIO_TAP = String.raw`
       const sourceNode = (sharedCtx || audioCtx).createMediaStreamSource(stream);
       rec.initSourceNode = async () => { rec.sourceNode = sourceNode; };
       await rec.start();
+      if (stopped) { await Promise.resolve(rec.stop?.()); return; }
+      recorder = rec;
       w.__humanty_audioRec = rec;
       w.__humanty_audioCtx = audioCtx;
       console.log('[humanty-page-audio] capture started, sample_rate=', audioCtx.sampleRate);
     } catch (e) { console.warn('[humanty-page-audio] start threw', e); }
   }
+
+  w.__humanty_stopAudioCapture = async () => {
+    if (stopped) return;
+    stopped = true;
+    if (readyTimer) clearTimeout(readyTimer);
+    observer?.disconnect();
+    observer = null;
+    try { await Promise.resolve(recorder?.stop?.()); } catch (e) {}
+    for (const node of boundNodes) {
+      try { node.disconnect(); } catch (e) {}
+    }
+    boundNodes.clear();
+    for (const track of sharedDest?.stream?.getTracks?.() || []) {
+      try { track.stop(); } catch (e) {}
+    }
+    if (sharedCtx && sharedCtx.state !== 'closed') {
+      try { await sharedCtx.close(); } catch (e) {}
+    }
+  };
 
   w.__humanty_audioInstalled = true;
   whenReady(startCapture);
