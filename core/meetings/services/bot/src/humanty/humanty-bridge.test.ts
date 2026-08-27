@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict';
+import { EventEmitter } from 'node:events';
 import type { Page } from 'playwright';
+import WebSocket from 'ws';
 import { HumantyBridge, parseMuxedFrame } from './humanty-bridge.js';
 import type { HumantyConfig } from './config.js';
 
@@ -69,5 +71,91 @@ assert.deepEqual(JSON.parse(sent[0]), {
   type: 'unmute.video.turn_played',
   turn_id: 'turn-42',
 });
+
+let pushOpus: ((audio: string) => Promise<void>) | undefined;
+const boundedSends: string[] = [];
+const hookPage = {
+  exposeFunction: async (name: string, callback: (audio: string) => Promise<void>) => {
+    if (name === '__humanty_pushOpus') pushOpus = callback;
+  },
+} as unknown as Page;
+const boundedBridge = new HumantyBridge(cfg, { page: hookPage, log: () => {} });
+const boundedInternals = boundedBridge as unknown as {
+  rt: { readyState: number; bufferedAmount: number; send(data: string): void };
+  exposePageHooks(): Promise<void>;
+};
+await boundedInternals.exposePageHooks();
+assert(pushOpus);
+boundedInternals.rt = {
+  readyState: WebSocket.OPEN,
+  bufferedAmount: 2 * 1024 * 1024,
+  send: (data) => boundedSends.push(data),
+};
+await pushOpus('T2dnUw==');
+assert.equal(boundedSends.length, 0, 'page audio must drop while websocket output is backed up');
+boundedInternals.rt.bufferedAmount = 0;
+await pushOpus('A'.repeat(600 * 1024));
+assert.equal(boundedSends.length, 0, 'oversized page audio must be rejected');
+await pushOpus('T2dnUw==');
+assert.equal(boundedSends.length, 1, 'bounded page audio should be forwarded');
+
+let decoderWrites = 0;
+const decoderBridge = new HumantyBridge(cfg, { page: {} as Page, log: () => {} });
+const decoderInternals = decoderBridge as unknown as {
+  ffmpegProc: { stdin: { destroyed: boolean; write(data: Buffer): boolean } };
+  paplayProc: { stdin: { destroyed: boolean } };
+  feedOggOpus(data: Buffer): void;
+};
+decoderInternals.ffmpegProc = {
+  stdin: { destroyed: false, write: () => { decoderWrites++; return false; } },
+};
+decoderInternals.paplayProc = { stdin: { destroyed: false } };
+decoderInternals.feedOggOpus(Buffer.from('first'));
+decoderInternals.feedOggOpus(Buffer.from('second'));
+assert.equal(decoderWrites, 1, 'decoder backpressure must drop later chunks until drain');
+
+class FakeSocket extends EventEmitter {
+  readyState = WebSocket.CONNECTING;
+  bufferedAmount = 0;
+  binaryType = 'nodebuffer';
+  closed = false;
+  send(): void {}
+  open(): void { this.readyState = WebSocket.OPEN; this.emit('open'); }
+  close(code = 1000): void {
+    if (this.closed) return;
+    this.closed = true;
+    this.readyState = WebSocket.CLOSED;
+    this.emit('close', code);
+  }
+  terminate(): void { this.close(1006); }
+}
+
+const sockets: FakeSocket[] = [];
+let rejectFirstVideo = true;
+const retryBridge = new HumantyBridge(cfg, {
+  page: { exposeFunction: async () => {} } as unknown as Page,
+  log: () => {},
+  wsOpenTimeoutMs: 50,
+  createWebSocket: (url) => {
+    const socket = new FakeSocket();
+    sockets.push(socket);
+    queueMicrotask(() => {
+      if (url.endsWith('/v1/video/stream') && rejectFirstVideo) {
+        rejectFirstVideo = false;
+        socket.close(1006);
+      } else {
+        socket.open();
+      }
+    });
+    return socket as unknown as WebSocket;
+  },
+});
+await assert.rejects(retryBridge.start());
+assert.equal(sockets[0].closed, true, 'failed video start must roll back realtime socket');
+await retryBridge.start();
+const socketCount = sockets.length;
+await Promise.all([retryBridge.start(), retryBridge.start()]);
+assert.equal(sockets.length, socketCount, 'concurrent/repeated starts must share one successful start');
+await retryBridge.stop();
 
 console.log('humanty-bridge.test.ts: PASS');
