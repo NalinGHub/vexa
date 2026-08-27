@@ -593,11 +593,12 @@ export async function launchBrowser(inv: Invocation): Promise<BrowserSession> {
   // joins; getJoinBrowserArgs() adds the fake-device / autoplay flags the join lane needs. The
   // join args win on conflict (later wins in Chromium arg parsing).
   const args = [...getAuthenticatedBrowserArgs(), ...getJoinBrowserArgs()];
-  // HUMANTY-SEAM: the overlay's fake-camera arg must be in the LAUNCH args (Chromium pins
-  // --use-file-for-fake-video-capture at startup; it cannot be set per-page later). The
-  // carrier's y4m FIFO is created by createVideoCarrier() before launchBrowser() runs.
-  if ((globalThis as any).__humantyCameraArg) args.push((globalThis as any).__humantyCameraArg);
   const { context, page } = await launchPersistentBrowser({ dataDir, args });
+
+  // HUMANTY-SEAM: install the canvas camera in every document before meeting code can call
+  // getUserMedia/addTrack. The script is registered before the join driver navigates.
+  const cameraInit = (globalThis as { __humantyCameraInitScript?: string }).__humantyCameraInitScript;
+  if (cameraInit) await context.addInitScript({ content: cameraInit });
 
   // Voice-agent gate the page reads to decide whether to keep the mic hot (production parity).
   await context.addInitScript(`window.__vexa_voice_agent_enabled = ${!!inv.voiceAgentEnabled};`);
@@ -654,7 +655,7 @@ export async function launchBrowser(inv: Invocation): Promise<BrowserSession> {
   await context.exposeFunction('logBot', (m: string) => console.log(`[page] ${m}`)).catch(() => { /* already registered */ });
   page.on('console', (msg) => {
     const t = msg.text();
-    if (/perspeaker|capture|stream|vexabrowser|audiocontext|error|fail/i.test(t)) console.log(`[page-console:${msg.type()}] ${t}`);
+    if (/humanty|perspeaker|capture|stream|vexabrowser|audiocontext|error|fail/i.test(t)) console.log(`[page-console:${msg.type()}] ${t}`);
   });
 
   return {

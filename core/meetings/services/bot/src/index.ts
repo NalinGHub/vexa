@@ -167,11 +167,13 @@ export async function main(env: NodeJS.ProcessEnv = process.env): Promise<number
   // ── build the LIVE transports → the pure orchestrator ──
   const meetingId = meetingChannelId(inv);
 
-  // HUMANTY-SEAM: build the overlay first — its camera arg must exist before launchBrowser()
-  // pins Chromium's fake video capture, and its lifecycle tee wraps the sink below. A no-op
+  // HUMANTY-SEAM: build the overlay first — its canvas-camera init script must exist before
+  // launchBrowser() creates the context, and its lifecycle tee wraps the sink below. A no-op
   // (null) unless HUMANTY_MODE/HUMANTY_BASE_URL is set.
   const humanty = createHumantyOverlay(inv.platform, env);
-  if (humanty?.cameraArg) (globalThis as { __humantyCameraArg?: string }).__humantyCameraArg = humanty.cameraArg;
+  if (humanty?.cameraInitScript) {
+    (globalThis as { __humantyCameraInitScript?: string }).__humantyCameraInitScript = humanty.cameraInitScript;
+  }
 
   // lifecycle.v1: HTTP POST to meeting-api when a callback URL is configured; console-only for
   // self-host (no callback). The HTTP sink retries/backs off and never throws out of emit.
@@ -187,18 +189,30 @@ export async function main(env: NodeJS.ProcessEnv = process.env): Promise<number
   // transcript.v1 + acts.v1: redis. Connect LAZILY — constructing the clients does NOT dial
   // redis, so an unreachable broker doesn't crash the composition root; the first publish/
   // subscribe surfaces the error and the orchestrator drives to a clean terminal `failed`.
-  const transcriptClient = redisClientFrom(inv.redisUrl);
-  const actsClient = redisActsClientFrom(inv.redisUrl);
-  const liveTranscript: TranscriptSink = createRedisTranscriptSink({
-    client: transcriptClient,
-    meetingId,
-    nativeMeetingId: inv.nativeMeetingId,
-    // Teams is the current blast radius. Its CSRC lanes need the same complete per-speaker pending
-    // snapshot the Dashboard already consumes for GMeet-style live rendering. Leave every sibling
-    // platform on the existing wire until this is proven on STAGE and deliberately imported back.
-    liveEnvelope: inv.platform === 'teams' ? 'speaker-snapshot' : 'segment',
-  });
-  const liveActs = createRedisActsSource({ client: actsClient, meetingId });
+  let liveTranscript: TranscriptSink;
+  let liveActs: ActsSource;
+  let transcriptClient: ReturnType<typeof redisClientFrom> | null = null;
+  let actsClient: ReturnType<typeof redisActsClientFrom> | null = null;
+  if (humanty) {
+    // Humanty owns STT + control over /v1/realtime and disables Vexa transcription/voice acts.
+    // Do not dial a Redis service this single-pod mode neither ships nor consumes.
+    liveTranscript = { async publish() { /* Humanty brain owns the transcript. */ } };
+    liveActs = { subscribe() { return () => { /* no native acts in Humanty mode */ }; } };
+    console.log('[bot] humanty mode: native transcript/acts adapters disabled');
+  } else {
+    transcriptClient = redisClientFrom(inv.redisUrl);
+    actsClient = redisActsClientFrom(inv.redisUrl);
+    liveTranscript = createRedisTranscriptSink({
+      client: transcriptClient,
+      meetingId,
+      nativeMeetingId: inv.nativeMeetingId,
+      // Teams is the current blast radius. Its CSRC lanes need the same complete per-speaker pending
+      // snapshot the Dashboard already consumes for GMeet-style live rendering. Leave every sibling
+      // platform on the existing wire until this is proven on STAGE and deliberately imported back.
+      liveEnvelope: inv.platform === 'teams' ? 'speaker-snapshot' : 'segment',
+    });
+    liveActs = createRedisActsSource({ client: actsClient, meetingId });
+  }
 
   // ── 2b: launch the browser + wire join / capture / recording / speak (L4-gated). ──
   // Browser-launch failure must NOT crash the root: fall back to the no-browser drivers so the
@@ -372,8 +386,8 @@ export async function main(env: NodeJS.ProcessEnv = process.env): Promise<number
     if (session) await session.close().catch(() => { /* best-effort */ });
     // Quit the redis connections on teardown (best-effort — a quit failure must not change the
     // exit code; they may never have connected if redis was unreachable).
-    await transcriptClient.quit().catch(() => { /* best-effort */ });
-    await actsClient.quit().catch(() => { /* best-effort */ });
+    if (transcriptClient) await transcriptClient.quit().catch(() => { /* best-effort */ });
+    if (actsClient) await actsClient.quit().catch(() => { /* best-effort */ });
   }
 }
 
