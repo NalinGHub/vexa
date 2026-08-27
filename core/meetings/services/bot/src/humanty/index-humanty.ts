@@ -67,6 +67,7 @@ export function createHumantyOverlay(platform: string, env: NodeJS.ProcessEnv = 
   let page: BrowserSession['page'] | null = null;
   let inMeetingStarted = false;
   let stopped = false;
+  let lifecycleEventSeq = 0;
 
   /** Upstream joins with mic + camera off. Turn both on only after admission,
    *  then attach the page-audio tap to the stable in-meeting document. */
@@ -138,7 +139,12 @@ export function createHumantyOverlay(platform: string, env: NodeJS.ProcessEnv = 
       fetch(`${httpBase}/v1/bot/_internal/event`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ event, message }),
+        body: JSON.stringify({
+          connection_id: e.connection_id,
+          event_seq: ++lifecycleEventSeq,
+          event,
+          message,
+        }),
       }).catch(() => { /* best-effort: the pod also polls process liveness */ });
     },
 
