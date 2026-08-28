@@ -1,7 +1,57 @@
 import assert from 'node:assert/strict';
-import { spawnSync } from 'node:child_process';
-import { chromium } from 'playwright';
+import { type ChildProcess, spawnSync } from 'node:child_process';
+import { EventEmitter } from 'node:events';
+import { chromium, type Page } from 'playwright';
 import { createVideoCarrier, PAGE_VIDEO_CARRIER, type VideoCarrier } from './video-carrier.js';
+
+function fakeDecoder(onWrite?: () => void): ChildProcess {
+  const child = new EventEmitter() as EventEmitter & Record<string, unknown>;
+  child.stdout = new EventEmitter();
+  child.stderr = new EventEmitter();
+  child.stdin = Object.assign(new EventEmitter(), {
+    destroyed: false,
+    write: () => { onWrite?.(); return true; },
+    end: () => {},
+  });
+  child.kill = () => true;
+  return child as unknown as ChildProcess;
+}
+
+const emptyCarrier = createVideoCarrier({} as Page, () => {});
+let emptyTurnPlayed = false;
+emptyCarrier.tagTurnEnd(() => { emptyTurnPlayed = true; });
+assert.equal(emptyTurnPlayed, false, 'a zero-frame turn must use the backend timeout fallback');
+await emptyCarrier.stop();
+
+const exitedDecoder = fakeDecoder();
+const exitedCarrier = createVideoCarrier(
+  {} as Page,
+  () => {},
+  () => exitedDecoder,
+);
+let exitedTurnPlayed = false;
+exitedCarrier.pushVideo(Buffer.from([0, 0, 0, 1]), 1);
+exitedCarrier.tagTurnEnd(() => { exitedTurnPlayed = true; });
+exitedDecoder.emit('exit', 1, null);
+assert.equal(exitedTurnPlayed, false, 'decoder exit must not ACK an unpainted turn');
+await exitedCarrier.stop();
+
+const rejectedPageDecoder = fakeDecoder();
+const rejectedPage = {
+  evaluate: async () => { throw new Error('execution context lost'); },
+} as unknown as Page;
+const rejectedPageCarrier = createVideoCarrier(
+  rejectedPage,
+  () => {},
+  () => rejectedPageDecoder,
+);
+let rejectedPageTurnPlayed = false;
+rejectedPageCarrier.pushVideo(Buffer.from([0, 0, 0, 1]), 1);
+rejectedPageCarrier.tagTurnEnd(() => { rejectedPageTurnPlayed = true; });
+rejectedPageDecoder.stdout?.emit('data', Buffer.from([0xff, 0xd8, 0xff, 0xd9]));
+await new Promise<void>((resolve) => setImmediate(resolve));
+assert.equal(rejectedPageTurnPlayed, false, 'page paint rejection must not ACK the turn');
+await rejectedPageCarrier.stop();
 
 const encoded = spawnSync('ffmpeg', [
   '-hide_banner', '-loglevel', 'error',

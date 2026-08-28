@@ -18,7 +18,17 @@ export interface VideoCarrier {
   stop(): Promise<void>;
 }
 
-export function createVideoCarrier(page: Page, log: (message: string) => void): VideoCarrier {
+type SpawnDecoder = (
+  command: string,
+  args: string[],
+  options: { stdio: ['pipe', 'pipe', 'pipe'] },
+) => ChildProcess;
+
+export function createVideoCarrier(
+  page: Page,
+  log: (message: string) => void,
+  spawnDecoder: SpawnDecoder = (command, args, options) => spawn(command, args, options),
+): VideoCarrier {
   let decoder: ChildProcess | null = null;
   let jpegBuffer = Buffer.alloc(0);
   let pendingFrame: { bytes: Buffer; sequence: number } | null = null;
@@ -37,13 +47,11 @@ export function createVideoCarrier(page: Page, log: (message: string) => void): 
     }
   }
 
-  function failOpenTurnEnds(reason: string): void {
+  function discardTurnEnds(reason: string): void {
     if (pendingTurnEnds.length > 0) {
-      log(`[humanty-cam] ${reason}; acknowledging ${pendingTurnEnds.length} unpaintable turn(s)`);
+      log(`[humanty-cam] ${reason}; discarding ${pendingTurnEnds.length} unpaintable turn(s)`);
     }
-    while (pendingTurnEnds.length > 0) {
-      try { pendingTurnEnds.shift()?.acknowledge(); } catch { /* best-effort */ }
-    }
+    pendingTurnEnds.length = 0;
     acceptedFrameSequence = decodedFrameSequence;
   }
 
@@ -95,6 +103,7 @@ export function createVideoCarrier(page: Page, log: (message: string) => void): 
       // Navigation destroys the old execution context. JPEGs are independent,
       // so discard the stale frame and let the next one paint on the new page.
       pendingFrame = null;
+      discardTurnEnds('page paint failed');
       log(`[humanty-cam] page handoff interrupted: ${String(error)}`);
     } finally {
       draining = false;
@@ -104,7 +113,7 @@ export function createVideoCarrier(page: Page, log: (message: string) => void): 
 
   function ensureDecoder(): void {
     if (decoder || stopped) return;
-    const child = spawn('ffmpeg', [
+    const child = spawnDecoder('ffmpeg', [
       '-hide_banner', '-loglevel', 'error',
       '-fflags', 'nobuffer', '-flags', 'low_delay',
       '-probesize', '32', '-analyzeduration', '0',
@@ -126,7 +135,7 @@ export function createVideoCarrier(page: Page, log: (message: string) => void): 
       if (decoder === child) {
         decoder = null;
         inputBlocked = false;
-        failOpenTurnEnds('decoder spawn failed');
+        discardTurnEnds('decoder spawn failed');
       }
     });
     child.on('exit', (code, signal) => {
@@ -134,7 +143,7 @@ export function createVideoCarrier(page: Page, log: (message: string) => void): 
       if (decoder === child) {
         decoder = null;
         inputBlocked = false;
-        failOpenTurnEnds('decoder exited');
+        discardTurnEnds('decoder exited');
       }
     });
   }
@@ -159,7 +168,11 @@ export function createVideoCarrier(page: Page, log: (message: string) => void): 
     },
     tagTurnEnd(acknowledge: () => void): void {
       const target = acceptedFrameSequence;
-      if (target === 0 || paintedFrameSequence >= target) {
+      if (target === 0) {
+        log('[humanty-cam] zero-frame turn left for backend timeout fallback');
+        return;
+      }
+      if (paintedFrameSequence >= target) {
         try { acknowledge(); } catch { /* listener must not break the carrier */ }
         return;
       }

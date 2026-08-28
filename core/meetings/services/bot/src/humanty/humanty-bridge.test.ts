@@ -72,6 +72,37 @@ assert.deepEqual(JSON.parse(sent[0]), {
   turn_id: 'turn-42',
 });
 
+for (const onTurnEnd of [undefined, () => { throw new Error('carrier failed'); }]) {
+  const failClosedSent: string[] = [];
+  const failClosedBridge = new HumantyBridge(cfg, {
+    page: {} as Page,
+    onTurnEnd,
+    log: () => {},
+  });
+  const failClosedInternals = failClosedBridge as unknown as {
+    vid: { send(data: string): void };
+    handleVideoControl(raw: string): void;
+  };
+  failClosedInternals.vid = { send: (data) => failClosedSent.push(data) };
+  failClosedInternals.handleVideoControl(JSON.stringify({
+    type: 'unmute.video.turn_end',
+    turn_id: 'unpainted-turn',
+  }));
+  assert.deepEqual(failClosedSent, [], 'turn ACK requires a successful paint callback');
+}
+
+const failedMediaBridge = new HumantyBridge(cfg, {
+  page: {
+    exposeFunction: async () => { throw new Error('page hook unavailable'); },
+  } as unknown as Page,
+  log: () => {},
+});
+await assert.rejects(
+  failedMediaBridge.startPageAudioCapture(),
+  /page hook unavailable/,
+  'media activation failures must reject startup',
+);
+
 let pushOpus: ((audio: string) => Promise<void>) | undefined;
 const boundedSends: string[] = [];
 const hookPage = {

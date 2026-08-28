@@ -25,6 +25,25 @@ import { createVideoCarrier, PAGE_VIDEO_CARRIER, type VideoCarrier } from './vid
 
 const log = (m: string): void => console.log(`[bot] ${m}`);
 
+export async function startWithRetry(
+  start: () => Promise<void>,
+  attempts = 3,
+  retryDelayMs = 1_000,
+  onFailure?: (error: unknown, attempt: number) => void,
+): Promise<void> {
+  if (attempts < 1) throw new RangeError('attempts must be positive');
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    try {
+      await start();
+      return;
+    } catch (error) {
+      onFailure?.(error, attempt);
+      if (attempt === attempts) throw error;
+      await new Promise<void>((resolve) => setTimeout(resolve, retryDelayMs));
+    }
+  }
+}
+
 /** The subset of LifecycleEvent the pod's state machine keys on (see unmute/bot_control.py). */
 function lifecycleToInternal(e: LifecycleEvent): { event: string; message?: string } {
   switch (e.status) {
@@ -47,11 +66,10 @@ export interface HumantyOverlay {
   readonly config: HumantyConfig;
   /** Document-start canvas camera + WebCodecs decoder, installed before navigation. */
   readonly cameraInitScript: string;
-  /** Wire the bridge against the live session. Resolves once both WS connections are up;
-   *  never throws (a failed bridge degrades to a transcription-only bot, loudly logged). */
+  /** Wire the bridge against the live session. Rejects unless both WS connections are up. */
   start(session: BrowserSession): Promise<void>;
-  /** Forward one lifecycle event to the pod's internal endpoint (best-effort). */
-  forwardLifecycle(e: LifecycleEvent): void;
+  /** Forward one lifecycle event after any required media activation completes. */
+  forwardLifecycle(e: LifecycleEvent): Promise<void>;
   /** Idempotent teardown — safe from any exit path (#593). */
   stop(): Promise<void>;
 }
@@ -65,35 +83,29 @@ export function createHumantyOverlay(platform: string, env: NodeJS.ProcessEnv = 
   let bridge: HumantyBridge | null = null;
   let carrier: VideoCarrier | null = null;
   let page: BrowserSession['page'] | null = null;
+  let bridgeReady = false;
   let inMeetingStarted = false;
   let stopped = false;
   let lifecycleEventSeq = 0;
-  let bridgeStartFailures = 0;
-  let bridgeRetryTimer: ReturnType<typeof setTimeout> | null = null;
 
   async function startBridgeWithRetry(): Promise<void> {
     const activeBridge = bridge;
-    if (!activeBridge || stopped) return;
-    try {
-      await activeBridge.start();
-      bridgeStartFailures = 0;
-    } catch (error) {
-      bridgeStartFailures++;
-      log(`[humanty] bridge start failed (attempt ${bridgeStartFailures}/3): ${String(error)}`);
-      if (stopped || activeBridge !== bridge || bridgeStartFailures >= 3 || bridgeRetryTimer) return;
-      bridgeRetryTimer = setTimeout(() => {
-        bridgeRetryTimer = null;
-        void startBridgeWithRetry();
-      }, 1_000);
-      bridgeRetryTimer.unref?.();
-    }
+    if (!activeBridge || stopped) throw new Error('humanty bridge unavailable during startup');
+    await startWithRetry(
+      () => activeBridge.start(),
+      3,
+      1_000,
+      (error, attempt) => log(`[humanty] bridge start failed (attempt ${attempt}/3): ${String(error)}`),
+    );
+    if (stopped || activeBridge !== bridge) throw new Error('humanty bridge stopped during startup');
+    bridgeReady = true;
   }
 
   /** Upstream joins with mic + camera off. Turn both on only after admission,
    *  then attach the page-audio tap to the stable in-meeting document. */
   async function startInMeetingMedia(livePage: import('playwright').Page): Promise<void> {
-    try {
-      const enabled = await livePage.evaluate(({ platform }) => {
+    if (!bridge || !bridgeReady) throw new Error('humanty bridge is not ready');
+    const enabled = await livePage.evaluate(({ platform }) => {
         // Structural shapes only — this package compiles without DOM libs.
         const doc = (globalThis as unknown as {
           document?: {
@@ -121,12 +133,28 @@ export function createHumantyOverlay(platform: string, env: NodeJS.ProcessEnv = 
         }
         return root.__humanty_activateCamera?.().then((replaced) => ({ mic, camera, replaced }))
           ?? Promise.resolve({ mic, camera, replaced: 0, platform });
-      }, { platform });
-      log(`[humanty] in-meeting media enabled (mic=${enabled.mic}, camera=${enabled.camera}, repaired_senders=${enabled.replaced})`);
-    } catch (e) {
-      log(`[humanty] in-meeting media enable failed (non-fatal): ${String(e)}`);
+    }, { platform });
+    if (!enabled.mic) throw new Error('meeting microphone could not be enabled');
+    if (!enabled.camera && enabled.replaced === 0) {
+      throw new Error('meeting camera could not be enabled or repaired');
     }
-    await bridge?.startPageAudioCapture();
+    await bridge.startPageAudioCapture();
+    log(`[humanty] in-meeting media enabled (mic=${enabled.mic}, camera=${enabled.camera}, repaired_senders=${enabled.replaced})`);
+  }
+
+  async function postInternal(e: LifecycleEvent, event: string, message?: string): Promise<void> {
+    if (!event || !cfg.baseUrl) return;
+    const httpBase = cfg.baseUrl.replace(/^ws/, 'http');
+    await fetch(`${httpBase}/v1/bot/_internal/event`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        connection_id: e.connection_id,
+        event_seq: ++lifecycleEventSeq,
+        event,
+        message,
+      }),
+    }).catch(() => { /* process liveness remains the final backstop */ });
   }
 
   const overlay: HumantyOverlay = {
@@ -134,7 +162,7 @@ export function createHumantyOverlay(platform: string, env: NodeJS.ProcessEnv = 
     cameraInitScript: PAGE_VIDEO_CARRIER,
 
     async start(session: BrowserSession): Promise<void> {
-      if (stopped) return;
+      if (stopped) throw new Error('humanty overlay is stopped');
       page = session.page;
       carrier = createVideoCarrier(session.page, log);
       bridge = new HumantyBridge(cfg, {
@@ -148,31 +176,24 @@ export function createHumantyOverlay(platform: string, env: NodeJS.ProcessEnv = 
       await startBridgeWithRetry();
     },
 
-    forwardLifecycle(e: LifecycleEvent): void {
-      if (e.status === 'active' && page && !inMeetingStarted) {
-        inMeetingStarted = true;
-        void startInMeetingMedia(page);
+    async forwardLifecycle(e: LifecycleEvent): Promise<void> {
+      if (e.status === 'active' && !inMeetingStarted) {
+        try {
+          if (!page || !bridgeReady) throw new Error('humanty media bridge is not ready');
+          await startInMeetingMedia(page);
+          inMeetingStarted = true;
+        } catch (error) {
+          await postInternal(e, 'error', `humanty media activation failed: ${String(error)}`);
+          throw error;
+        }
       }
       const { event, message } = lifecycleToInternal(e);
-      if (!event || !cfg.baseUrl) return;
-      const httpBase = cfg.baseUrl.replace(/^ws/, 'http');
-      fetch(`${httpBase}/v1/bot/_internal/event`, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({
-          connection_id: e.connection_id,
-          event_seq: ++lifecycleEventSeq,
-          event,
-          message,
-        }),
-      }).catch(() => { /* best-effort: the pod also polls process liveness */ });
+      await postInternal(e, event, message);
     },
 
     async stop(): Promise<void> {
       if (stopped) return;
       stopped = true;
-      if (bridgeRetryTimer) clearTimeout(bridgeRetryTimer);
-      bridgeRetryTimer = null;
       await bridge?.stop().catch(() => {});
       await carrier?.stop().catch(() => {});
     },

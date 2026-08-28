@@ -180,10 +180,10 @@ export async function main(env: NodeJS.ProcessEnv = process.env): Promise<number
   const lifecycle: LifecycleSink = inv.meetingApiCallbackUrl
     ? createHttpLifecycleSink({ callbackUrl: inv.meetingApiCallbackUrl, internalSecret: inv.internalSecret })
     : consoleLifecycleSink();
-  // HUMANTY-SEAM: tee every lifecycle event to the pod's /v1/bot/_internal/event so
-  // humanty-backend's state machine tracks the bot live (best-effort, never throws).
+  // HUMANTY-SEAM: tee every lifecycle event to the pod's /v1/bot/_internal/event.
+  // Run the Humanty side first so `active` is not published until media activation succeeds.
   const lifecycleWithHumanty: LifecycleSink = humanty
-    ? { emit: async (e) => { await lifecycle.emit(e); humanty.forwardLifecycle(e); } }
+    ? { emit: async (e) => { await humanty.forwardLifecycle(e); await lifecycle.emit(e); } }
     : lifecycle;
 
   // transcript.v1 + acts.v1: redis. Connect LAZILY — constructing the clients does NOT dial
@@ -285,9 +285,9 @@ export async function main(env: NodeJS.ProcessEnv = process.env): Promise<number
     // the page.evaluate on the BLANK pre-navigation page (no VexaBrowserUtils, no audio), and the
     // subsequent goto to the meeting URL destroyed that context — so capture never attached. (L4.)
     const sess = session, bp = botPipeline, rec = recording;
-    // HUMANTY-SEAM: the interviewer brain + avatar feed ride the live session. Best-effort:
-    // a bridge failure degrades to a transcription-only bot (logged), never breaks the join.
-    if (humanty) void humanty.start(sess).catch((e) => console.error(`[bot] humanty overlay start failed: ${serr(e)}`));
+    // HUMANTY-SEAM: Humanty owns transcript, audio, and avatar media in this mode.
+    // Do not enter a meeting unless both backend WebSockets are actually connected.
+    if (humanty) await humanty.start(sess);
     restartCapture = () => {
       void restartMixedCapture(sess.page)
         .then((requested) => console.log(`[bot] capture restart ${requested ? 'requested' : 'not applicable (no mixed rescan)'}`))

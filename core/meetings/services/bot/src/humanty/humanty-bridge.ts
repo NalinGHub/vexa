@@ -78,7 +78,11 @@ export function parseMuxedFrame(buf: Buffer): MuxedFrame | null {
 
 function pactl(args: string, log: (m: string) => void): void {
   try {
-    spawn('pactl', args.split(' '), { stdio: 'ignore' }).on('error', () => {});
+    const child = spawn('pactl', args.split(' '), { stdio: 'ignore' });
+    child.on('error', (error) => log(`[humanty] pactl ${args} failed: ${error.message}`));
+    child.on('exit', (code) => {
+      if (code !== 0) log(`[humanty] pactl ${args} exited ${code}`);
+    });
   } catch (e) {
     log(`[humanty] pactl ${args} failed: ${String(e)}`);
   }
@@ -155,34 +159,29 @@ export class HumantyBridge {
    */
   async startPageAudioCapture(): Promise<void> {
     const page = this.deps.page;
-    try {
-      // Assets resolve relative to THIS module (dist/humanty/ → ../../assets)
-      // so the path works both in-image (/opt/...) and from a repo checkout.
-      const here = dirname(fileURLToPath(import.meta.url));
-      const assets = process.env.HUMANTY_AUDIO_ASSETS
-        ?? join(here, '..', '..', 'assets', 'humanty-audio');
+    // Assets resolve relative to THIS module (dist/humanty/ → ../../assets)
+    // so the path works both in-image (/opt/...) and from a repo checkout.
+    const here = dirname(fileURLToPath(import.meta.url));
+    const assets = process.env.HUMANTY_AUDIO_ASSETS
+      ?? join(here, '..', '..', 'assets', 'humanty-audio');
 
-      // The ENCODER WORKER cannot ride page.route: AudioWorklet.addModule
-      // fetches bypass Playwright interception (verified 2026-08-26 — route
-      // never fires, worklet load aborts). Hand it to the page as a data URL
-      // through this bridge function instead.
-      const encSrc = readFileSync(join(assets, 'encoderWorker.min.js'), 'utf8');
-      await page.exposeFunction('__humantyGetEncoderUrl', () =>
-        `data:application/javascript;base64,${Buffer.from(encSrc).toString('base64')}`
-      ).catch(() => { /* already exposed */ });
+    // The ENCODER WORKER cannot ride page.route: AudioWorklet.addModule
+    // fetches bypass Playwright interception (verified 2026-08-26 — route
+    // never fires, worklet load aborts). Hand it to the page as a data URL
+    // through this bridge function instead.
+    const encSrc = readFileSync(join(assets, 'encoderWorker.min.js'), 'utf8');
+    await page.exposeFunction('__humantyGetEncoderUrl', () =>
+      `data:application/javascript;base64,${Buffer.from(encSrc).toString('base64')}`
+    );
 
-      // opus-recorder UMD first (defines window.Recorder), then the tap.
-      await page.addScriptTag({
-        content: readFileSync(join(assets, 'recorder.min.js'), 'utf8'),
-      }).catch((e) => this.deps.log(`[humanty] recorder inject failed: ${String(e)}`));
-      // The tap script: waits for media elements, builds the combined stream,
-      // records with opus-recorder, pushes base64 Ogg-Opus to Node.
-      await page.addScriptTag({ content: PAGE_AUDIO_TAP }).catch((e) =>
-        this.deps.log(`[humanty] audio tap inject failed: ${String(e)}`));
-      this.deps.log('[humanty] page audio capture requested');
-    } catch (e) {
-      this.deps.log(`[humanty] startPageAudioCapture failed (non-fatal): ${String(e)}`);
-    }
+    // opus-recorder UMD first (defines window.Recorder), then the tap.
+    await page.addScriptTag({
+      content: readFileSync(join(assets, 'recorder.min.js'), 'utf8'),
+    });
+    // The tap script waits for media elements, builds the combined stream,
+    // records with opus-recorder, and pushes base64 Ogg-Opus to Node.
+    await page.addScriptTag({ content: PAGE_AUDIO_TAP });
+    this.deps.log('[humanty] page audio capture requested');
   }
 
   /** Idempotent, never throws — safe to call from any teardown path (#593). */
@@ -366,9 +365,9 @@ export class HumantyBridge {
       };
       try {
         if (this.deps.onTurnEnd) this.deps.onTurnEnd(acknowledge);
-        else acknowledge();
-      } catch {
-        acknowledge();
+        else this.deps.log(`[humanty] turn ${turnId} has no camera paint fence; waiting for backend fallback`);
+      } catch (error) {
+        this.deps.log(`[humanty] turn ${turnId} paint fence failed: ${String(error)}`);
       }
       return;
     }
@@ -466,12 +465,15 @@ export class HumantyBridge {
       '--device=tts_sink',
     ], { stdio: ['pipe', 'ignore', 'pipe'] });
     ff.stdout.pipe(paplay.stdin);
-    ff.stdout.once('data', () => log('[humanty] answer PCM reached paplay'));
+    ff.stdout.once('data', () => log('[humanty] answer PCM decoded'));
     ff.stdin.on('error', () => { /* decoder exited between packets */ });
     ff.stdin.on('drain', () => { this.audioInputBlocked = false; });
     ff.on('error', (e) => log(`[humanty] ffmpeg spawn failed: ${e.message}`));
     paplay.on('error', (e) => log(`[humanty] paplay spawn failed: ${e.message}`));
-    paplay.stderr?.on('data', () => { /* noisy; failures surface as silence + exit */ });
+    paplay.stderr?.on('data', (data: Buffer) => {
+      const message = data.toString().trim();
+      if (message) log(`[humanty] paplay: ${message.slice(0, 300)}`);
+    });
     ff.on('exit', () => {
       if (this.ffmpegProc === ff) {
         this.ffmpegProc = null;
@@ -480,7 +482,10 @@ export class HumantyBridge {
       try { paplay.kill('SIGTERM'); } catch { /* ignore */ }
       this.paplayProc = null;
     });
-    paplay.on('exit', () => {
+    paplay.on('exit', (code, signal) => {
+      if (!this.stopping && code !== 0) {
+        log(`[humanty] paplay exited code=${code} signal=${signal ?? ''}`);
+      }
       if (this.paplayProc === paplay) this.paplayProc = null;
       if (this.ffmpegProc === ff) {
         try { ff.kill('SIGTERM'); } catch { /* ignore */ }
